@@ -1,0 +1,4 @@
+target/
+push.sh
+.*
+.git/

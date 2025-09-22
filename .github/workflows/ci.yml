@@ -1,0 +1,40 @@
+# Continuous Integration workflow for building  to check build is ok
+
+name: CI - Build Carbon White
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build with cargo leptos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-leptos
+        run: cargo binstall cargo-leptos --no-confirm
+
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build Carbon-White
+        run: cargo leptos build
+
+      - name: Test
+        run: cargo test
+
+      - name: Test lib
+        run: CARBON_AUTH_KEY="test" cargo test --features ssr --lib
