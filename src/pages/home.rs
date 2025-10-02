@@ -212,7 +212,7 @@ fn SearchResultRow(result: SearchResult) -> impl IntoView {
             <td class="result-storage-date">{result.storage_date}</td>
             <td class="result-actions">
                 <a href={download_url} class="download-button" target="_blank">
-                    "Download"
+                    "View"
                 </a>
             </td>
         </tr>

@@ -105,7 +105,6 @@ mod tests {
 
 #[cfg(feature = "ssr")]
 pub fn shell(options: LeptosOptions) -> impl IntoView {
-    
     use leptos::prelude::*;
 
     view! {

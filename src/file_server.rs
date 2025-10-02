@@ -78,9 +78,9 @@ pub async fn serve_file(
         file_content.len().to_string().parse().unwrap(),
     );
 
-    // Set Content-Disposition to suggest filename for download
+    // Set Content-Disposition to inline so files open in browser instead of downloading
     let content_disposition = format!(
-        "attachment; filename=\"{}\"",
+        "inline; filename=\"{}\"",
         sanitize_filename(&document.original_file_name)
     );
     headers.insert(
