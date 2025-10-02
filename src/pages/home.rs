@@ -126,7 +126,7 @@ pub fn HomePage() -> impl IntoView {
                     </Show>
                 </div>
 
-                <SearchResults results=search_results search_term=search_term/>
+                <SearchResults results=search_results search_term=search_term is_authenticated=is_authenticated/>
             </div>
 
             <Footer/>
@@ -138,6 +138,7 @@ pub fn HomePage() -> impl IntoView {
 fn SearchResults(
     results: ReadSignal<Vec<SearchResult>>,
     search_term: ReadSignal<String>,
+    is_authenticated: ReadSignal<bool>,
 ) -> impl IntoView {
     let results_count = move || results.get().len();
     let is_search_empty = move || search_term.get().trim().is_empty();
@@ -183,7 +184,7 @@ fn SearchResults(
                                 key=|result| result.file_sha256.clone()
                                 children=move |result| {
                                     view! {
-                                        <SearchResultRow result/>
+                                        <SearchResultRow result is_authenticated/>
                                     }
                                 }
                             />
@@ -196,8 +197,9 @@ fn SearchResults(
 }
 
 #[component]
-fn SearchResultRow(result: SearchResult) -> impl IntoView {
+fn SearchResultRow(result: SearchResult, is_authenticated: ReadSignal<bool>) -> impl IntoView {
     let download_url = format!("/file/{}", result.file_sha256);
+    let edit_url = format!("/edit/{}", result.file_sha256);
 
     view! {
         <tr class="result-row">
@@ -214,6 +216,14 @@ fn SearchResultRow(result: SearchResult) -> impl IntoView {
                 <a href={download_url} class="download-button" target="_blank">
                     "View"
                 </a>
+                <Show
+                    when=move || is_authenticated.get()
+                    fallback=|| view! { <div></div> }
+                >
+                    <a href=edit_url.clone() class="edit-button">
+                        "Edit"
+                    </a>
+                </Show>
             </td>
         </tr>
     }

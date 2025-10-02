@@ -1,10 +1,9 @@
-use std::time::Duration;
-
 use crate::pages::*;
 use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::components::{Route, Router, Routes, RoutingProgress};
 use leptos_router_macro::path;
+use std::time::Duration;
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -39,6 +38,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/") view=HomePage/>
                     <Route path=path!("/login") view=LoginPage/>
                     <Route path=path!("/submit") view=SubmitPage/>
+                    <Route path=path!("/edit/:sha256") view=EditPage/>
 
                 </Routes>
             </main>

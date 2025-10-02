@@ -26,7 +26,7 @@ WORKDIR /app
 COPY . .
 
 # Build the app
-RUN cargo leptos build --release -vv
+RUN cargo leptos build --release
 
 FROM debian:trixie-slim AS runtime
 WORKDIR /app

@@ -152,6 +152,48 @@ pub async fn insert_or_update_document(
     Ok(result.last_insert_rowid())
 }
 
+pub async fn update_document_metadata(
+    pool: &SqlitePool,
+    sha256: &str,
+    title: &str,
+    part_number: Option<&str>,
+    manufacturer: Option<&str>,
+    document_id: Option<&str>,
+    document_version: Option<&str>,
+    package_marking: Option<&str>,
+    device_address: Option<&str>,
+    notes: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE documents
+        SET title = ?,
+            part_number = ?,
+            manufacturer = ?,
+            document_id = ?,
+            document_version = ?,
+            package_marking = ?,
+            device_address = ?,
+            notes = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE file_sha256 = ?
+        "#,
+    )
+    .bind(title)
+    .bind(part_number)
+    .bind(manufacturer)
+    .bind(document_id)
+    .bind(document_version)
+    .bind(package_marking)
+    .bind(device_address)
+    .bind(notes)
+    .bind(sha256)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn search_documents(
     pool: &SqlitePool,
     query: &str,
@@ -312,21 +354,33 @@ pub struct DocumentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tempfile::{tempdir, TempDir};
 
-    async fn setup_test_db() -> SqlitePool {
-        let temp_dir = tempdir().unwrap();
+    pub struct TestDb {
+        pub pool: SqlitePool,
+        _temp_dir: TempDir, // Only tracked for cleanup
+    }
+
+    async fn setup_test_db() -> TestDb {
+        let temp_dir =
+            tempdir().unwrap_or_else(|e| panic!("Failed to create temp dir for test {}", e));
         let data_dir = temp_dir.path().to_str().unwrap();
-        init_db(data_dir).await.unwrap()
+        let pool = init_db(data_dir).await.unwrap();
+
+        TestDb {
+            pool,
+            _temp_dir: temp_dir,
+        }
     }
 
     #[tokio::test]
     async fn test_database_initialization() {
-        let pool = setup_test_db().await;
+        let test_db = setup_test_db().await;
 
         // Test that we can query the documents table
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
-            .fetch_one(&pool)
+            .fetch_one(&test_db.pool)
             .await
             .unwrap();
 
@@ -335,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_and_search_document() {
-        let pool = setup_test_db().await;
+        let test_db = setup_test_db().await;
 
         let new_doc = NewDocument {
             title: "Test Document".to_string(),
@@ -352,11 +406,13 @@ mod tests {
             file_path: "/tmp/test/abcd1234567890/test.pdf".to_string(),
         };
 
-        let id = insert_or_update_document(&pool, new_doc).await.unwrap();
+        let id = insert_or_update_document(&test_db.pool, new_doc)
+            .await
+            .unwrap();
         assert!(id > 0);
 
         // Test search
-        let results = search_documents(&pool, "Test").await.unwrap();
+        let results = search_documents(&test_db.pool, "Test").await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Test Document");
         assert_eq!(results[0].part_number, Some("PN123".to_string()));
@@ -364,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_document_by_sha256() {
-        let pool = setup_test_db().await;
+        let test_db = setup_test_db().await;
 
         let new_doc = NewDocument {
             title: "SHA Test Document".to_string(),
@@ -381,9 +437,11 @@ mod tests {
             file_path: "/tmp/test/unique_sha256_hash/sha_test.pdf".to_string(),
         };
 
-        insert_or_update_document(&pool, new_doc).await.unwrap();
+        insert_or_update_document(&test_db.pool, new_doc)
+            .await
+            .unwrap();
 
-        let result = get_document_by_sha256(&pool, "unique_sha256_hash")
+        let result = get_document_by_sha256(&test_db.pool, "unique_sha256_hash")
             .await
             .unwrap();
         assert!(result.is_some());
@@ -394,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_document_exists_by_sha256() {
-        let pool = setup_test_db().await;
+        let test_db = setup_test_db().await;
 
         let new_doc = NewDocument {
             title: "Exists Test".to_string(),
@@ -411,20 +469,24 @@ mod tests {
             file_path: "/tmp/test/exists_test_hash/exists.pdf".to_string(),
         };
 
-        assert!(!document_exists_by_sha256(&pool, "exists_test_hash")
+        assert!(
+            !document_exists_by_sha256(&test_db.pool, "exists_test_hash")
+                .await
+                .unwrap()
+        );
+
+        insert_or_update_document(&test_db.pool, new_doc)
             .await
-            .unwrap());
+            .unwrap();
 
-        insert_or_update_document(&pool, new_doc).await.unwrap();
-
-        assert!(document_exists_by_sha256(&pool, "exists_test_hash")
+        assert!(document_exists_by_sha256(&test_db.pool, "exists_test_hash")
             .await
             .unwrap());
     }
 
     #[tokio::test]
     async fn test_get_document_stats() {
-        let pool = setup_test_db().await;
+        let test_db = setup_test_db().await;
 
         // Insert test documents
         let doc1 = NewDocument {
@@ -457,19 +519,21 @@ mod tests {
             file_path: "/tmp/test/hash2/doc2.pdf".to_string(),
         };
 
-        insert_or_update_document(&pool, doc1).await.unwrap();
-        insert_or_update_document(&pool, doc2).await.unwrap();
+        insert_or_update_document(&test_db.pool, doc1)
+            .await
+            .unwrap();
+        insert_or_update_document(&test_db.pool, doc2)
+            .await
+            .unwrap();
 
-        let stats = get_document_stats(&pool).await.unwrap();
+        let stats = get_document_stats(&test_db.pool).await.unwrap();
         assert_eq!(stats.total_documents, 2);
         assert_eq!(stats.unique_manufacturers, 2);
     }
 
     #[tokio::test]
     async fn test_get_latest_documents() {
-        let temp_dir = tempdir().unwrap();
-        let data_dir = temp_dir.path().to_str().unwrap();
-        let pool = init_db(data_dir).await.unwrap();
+        let test_db = setup_test_db().await;
 
         // Insert test documents with different timestamps
         let doc1 = NewDocument {
@@ -518,12 +582,18 @@ mod tests {
         };
 
         // Insert documents in order
-        insert_or_update_document(&pool, doc1).await.unwrap();
-        insert_or_update_document(&pool, doc2).await.unwrap();
-        insert_or_update_document(&pool, doc3).await.unwrap();
+        insert_or_update_document(&test_db.pool, doc1)
+            .await
+            .unwrap();
+        insert_or_update_document(&test_db.pool, doc2)
+            .await
+            .unwrap();
+        insert_or_update_document(&test_db.pool, doc3)
+            .await
+            .unwrap();
 
         // Get latest 2 documents
-        let latest = get_latest_documents(&pool, 2).await.unwrap();
+        let latest = get_latest_documents(&test_db.pool, 2).await.unwrap();
         assert_eq!(latest.len(), 2);
 
         // Should be ordered by ID descending (most recent first)
@@ -531,14 +601,105 @@ mod tests {
         assert_eq!(latest[1].title, "Second Document");
 
         // Test with limit larger than available documents
-        let all_latest = get_latest_documents(&pool, 10).await.unwrap();
+        let all_latest = get_latest_documents(&test_db.pool, 10).await.unwrap();
         assert_eq!(all_latest.len(), 3);
         assert_eq!(all_latest[0].title, "Third Document");
         assert_eq!(all_latest[1].title, "Second Document");
         assert_eq!(all_latest[2].title, "First Document");
 
         // Test with limit of 0
-        let none = get_latest_documents(&pool, 0).await.unwrap();
+        let none = get_latest_documents(&test_db.pool, 0).await.unwrap();
         assert_eq!(none.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_document_metadata() {
+        let test_db = setup_test_db().await;
+
+        // Insert a document first
+        let new_doc = NewDocument {
+            title: "Original Title".to_string(),
+            part_number: Some("PN001".to_string()),
+            manufacturer: Some("Original Mfg".to_string()),
+            document_id: Some("DOC001".to_string()),
+            document_version: Some("1.0".to_string()),
+            package_marking: Some("QFN32".to_string()),
+            device_address: Some("0x48".to_string()),
+            notes: Some("Original notes".to_string()),
+            storage_date: "2024-01-01".to_string(),
+            original_file_name: "test.pdf".to_string(),
+            file_sha256: "update_test_hash".to_string(),
+            file_path: "/tmp/test/update_test_hash.pdf".to_string(),
+        };
+
+        insert_or_update_document(&test_db.pool, new_doc)
+            .await
+            .unwrap();
+
+        // Update the document metadata
+        update_document_metadata(
+            &test_db.pool,
+            "update_test_hash",
+            "Updated Title",
+            Some("PN002"),
+            Some("Updated Mfg"),
+            Some("DOC002"),
+            Some("2.0"),
+            Some("BGA64"),
+            Some("0x49"),
+            Some("Updated notes"),
+        )
+        .await
+        .unwrap();
+
+        // Verify the update
+        let updated_doc = get_document_by_sha256(&test_db.pool, "update_test_hash")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated_doc.title, "Updated Title");
+        assert_eq!(updated_doc.part_number, Some("PN002".to_string()));
+        assert_eq!(updated_doc.manufacturer, Some("Updated Mfg".to_string()));
+        assert_eq!(updated_doc.document_id, Some("DOC002".to_string()));
+        assert_eq!(updated_doc.document_version, Some("2.0".to_string()));
+        assert_eq!(updated_doc.package_marking, Some("BGA64".to_string()));
+        assert_eq!(updated_doc.device_address, Some("0x49".to_string()));
+        assert_eq!(updated_doc.notes, Some("Updated notes".to_string()));
+
+        // File-related fields should remain unchanged
+        assert_eq!(updated_doc.file_sha256, "update_test_hash");
+        assert_eq!(updated_doc.original_file_name, "test.pdf");
+        assert_eq!(updated_doc.storage_date, "2024-01-01");
+
+        // Test updating with None values
+        update_document_metadata(
+            &test_db.pool,
+            "update_test_hash",
+            "Title Only",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let updated_doc2 = get_document_by_sha256(&test_db.pool, "update_test_hash")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated_doc2.title, "Title Only");
+        assert_eq!(updated_doc2.part_number, None);
+        assert_eq!(updated_doc2.manufacturer, None);
+        assert_eq!(updated_doc2.document_id, None);
+        assert_eq!(updated_doc2.document_version, None);
+        assert_eq!(updated_doc2.package_marking, None);
+        assert_eq!(updated_doc2.device_address, None);
+        assert_eq!(updated_doc2.notes, None);
     }
 }

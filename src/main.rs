@@ -1,3 +1,4 @@
+#![recursion_limit = "1024"]
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {

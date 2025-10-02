@@ -276,9 +276,26 @@ a {
       font-size: 0.9rem;
       font-weight: 500;
       transition: var(--transition);
+      margin-right: 0.5rem;
 
       &:hover {
         background-color: var(--primary-color);
+        box-shadow: var(--elevation-2);
+      }
+    }
+
+    .edit-button {
+      background-color: var(--primary-color);
+      color: var(--on-primary);
+      padding: 0.5rem 1rem;
+      border-radius: var(--border-radius);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: var(--transition);
+
+      &:hover {
+        background-color: var(--primary-variant);
         box-shadow: var(--elevation-2);
       }
     }
@@ -289,6 +306,26 @@ a {
 .form-group {
   margin-bottom: 1.5rem;
   flex: 1;
+}
+
+.file-info {
+  .file-display {
+    background-color: var(--surface-color);
+    padding: 0.75rem;
+    border-radius: var(--border-radius);
+    border: 1px solid var(--divider);
+    font-family: 'Roboto Mono', monospace;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+  }
+
+  .file-note {
+    font-size: 0.8rem;
+    color: var(--text-disabled);
+    font-style: italic;
+    margin: 0;
+  }
 }
 
 .form-row {
@@ -582,7 +619,8 @@ a {
 .submit-button:focus,
 .cancel-button:focus,
 .header-button:focus,
-.download-button:focus {
+.download-button:focus,
+.edit-button:focus {
   outline: 2px solid var(--primary-color);
   outline-offset: 2px;
 }

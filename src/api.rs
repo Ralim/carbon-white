@@ -1,8 +1,8 @@
 use axum::{
-    extract::{ConnectInfo, Multipart, Query, State},
+    extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -284,6 +284,8 @@ pub fn create_api_routes() -> Router<AppState> {
         .route("/auth/status", get(handle_auth_status))
         .route("/search", get(handle_search))
         .route("/submit", post(handle_submit))
+        .route("/document/{sha256}", get(handle_get_document))
+        .route("/document/{sha256}", put(handle_update_document))
 }
 
 pub async fn handle_auth(
@@ -630,4 +632,174 @@ pub async fn handle_submit(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateDocumentRequest {
+    pub title: String,
+    pub part_number: Option<String>,
+    pub manufacturer: Option<String>,
+    pub document_id: Option<String>,
+    pub document_version: Option<String>,
+    pub package_marking: Option<String>,
+    pub device_address: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DocumentResponse {
+    pub id: i64,
+    pub title: String,
+    pub part_number: Option<String>,
+    pub manufacturer: Option<String>,
+    pub document_id: Option<String>,
+    pub document_version: Option<String>,
+    pub package_marking: Option<String>,
+    pub device_address: Option<String>,
+    pub notes: Option<String>,
+    pub storage_date: String,
+    pub original_file_name: String,
+    pub file_sha256: String,
+    pub file_path: String,
+}
+
+pub async fn handle_get_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(sha256): AxumPath<String>,
+) -> Result<Json<DocumentResponse>, StatusCode> {
+    // Authenticate the user
+    if !authenticate_request(&headers, &state).await {
+        warn!(
+            "Unauthorized document retrieval attempt for SHA256: {}",
+            sha256
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Validate SHA256 format
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        warn!("Invalid SHA256 format: {}", sha256);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match database::get_document_by_sha256(&state.database, &sha256).await {
+        Ok(Some(document)) => {
+            info!("Document retrieved successfully: {}", sha256);
+            Ok(Json(DocumentResponse {
+                id: document.id,
+                title: document.title,
+                part_number: document.part_number,
+                manufacturer: document.manufacturer,
+                document_id: document.document_id,
+                document_version: document.document_version,
+                package_marking: document.package_marking,
+                device_address: document.device_address,
+                notes: document.notes,
+                storage_date: document.storage_date,
+                original_file_name: document.original_file_name,
+                file_sha256: document.file_sha256,
+                file_path: document.file_path,
+            }))
+        }
+        Ok(None) => {
+            warn!("Document not found: {}", sha256);
+            Err(StatusCode::NOT_FOUND)
+        }
+        Err(e) => {
+            error!("Database error retrieving document {}: {}", sha256, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+pub async fn handle_update_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(sha256): AxumPath<String>,
+    Json(update_request): Json<UpdateDocumentRequest>,
+) -> Result<Json<UpdateResponse>, StatusCode> {
+    // Authenticate the user
+    if !authenticate_request(&headers, &state).await {
+        warn!(
+            "Unauthorized document update attempt for SHA256: {}",
+            sha256
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Validate SHA256 format
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        warn!("Invalid SHA256 format: {}", sha256);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate required fields
+    if update_request.title.trim().is_empty() {
+        return Ok(Json(UpdateResponse {
+            success: false,
+            message: "Title is required".to_string(),
+        }));
+    }
+
+    // Check if document exists
+    match database::get_document_by_sha256(&state.database, &sha256).await {
+        Ok(Some(_existing_doc)) => {
+            // Update the document
+            match database::update_document_metadata(
+                &state.database,
+                &sha256,
+                &update_request.title,
+                update_request.part_number.as_deref(),
+                update_request.manufacturer.as_deref(),
+                update_request.document_id.as_deref(),
+                update_request.document_version.as_deref(),
+                update_request.package_marking.as_deref(),
+                update_request.device_address.as_deref(),
+                update_request.notes.as_deref(),
+            )
+            .await
+            {
+                Ok(_) => {
+                    info!("Document {} updated successfully", sha256);
+                    Ok(Json(UpdateResponse {
+                        success: true,
+                        message: "Document updated successfully".to_string(),
+                    }))
+                }
+                Err(e) => {
+                    error!("Database error updating document {}: {}", sha256, e);
+                    Ok(Json(UpdateResponse {
+                        success: false,
+                        message: "Database error occurred".to_string(),
+                    }))
+                }
+            }
+        }
+        Ok(None) => {
+            warn!("Document not found for update: {}", sha256);
+            Err(StatusCode::NOT_FOUND)
+        }
+        Err(e) => {
+            error!("Database error checking document {}: {}", sha256, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn authenticate_request(headers: &HeaderMap, _state: &AppState) -> bool {
+    if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                return crate::auth::verify_jwt_token(token).is_ok();
+            }
+        }
+    }
+    false
 }
