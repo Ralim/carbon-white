@@ -21,7 +21,7 @@ static JWT_SECRET: Lazy<Vec<u8>> = Lazy::new(|| {
 
 const JWT_EXPIRATION_HOURS: i64 = 24;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct Claims {
     pub sub: String, // Subject (typically user ID)
     pub exp: usize,  // Expiration timestamp
