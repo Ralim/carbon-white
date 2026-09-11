@@ -24,8 +24,8 @@ async fn main() {
         env::var("CARBON_DATA_DIR").unwrap_or_else(|_| "/tmp/carbon/".to_string());
     let carbon_auth_key = env::var("CARBON_AUTH_KEY").expect("CARBON_AUTH_KEY must be set");
     let carbon_whitelist_ips = env::var("CARBON_WHITELIST_IPS").unwrap_or_else(|_| {
-        warn!("CARBON_WHITELIST_IPS not set, allowing all IPs");
-        "".to_string()
+        warn!("CARBON_WHITELIST_IPS not set");
+        "127.0.0.1,::1".to_string()
     });
 
     info!("Carbon data directory: `{}`", carbon_data_dir);
