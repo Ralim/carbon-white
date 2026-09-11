@@ -1,12 +1,13 @@
 use std::net::IpAddr;
 
+#[derive(Debug, Clone)]
 pub struct IPSubnet {
     ip_address: IpAddr,
     mask: u8,
 }
 impl IPSubnet {
     // Test if the given IP address is within this subnet
-    pub fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: &IpAddr) -> bool {
         match (self.ip_address, ip) {
             (IpAddr::V4(subnet_ip), IpAddr::V4(target_ip)) => {
                 let mask_len = self.mask;
@@ -15,7 +16,7 @@ impl IPSubnet {
                 }
 
                 let mask = u32::MAX.checked_shl(32 - mask_len as u32).unwrap_or(0);
-                (u32::from(subnet_ip) & mask) == (u32::from(target_ip) & mask)
+                (u32::from(subnet_ip) & mask) == (u32::from(*target_ip) & mask)
             }
             (IpAddr::V6(subnet_ip), IpAddr::V6(target_ip)) => {
                 let mask_len = self.mask;
@@ -24,7 +25,7 @@ impl IPSubnet {
                 }
 
                 let mask = u128::MAX.checked_shl(128 - mask_len as u32).unwrap_or(0);
-                (u128::from(subnet_ip) & mask) == (u128::from(target_ip) & mask)
+                (u128::from(subnet_ip) & mask) == (u128::from(*target_ip) & mask)
             }
             // Mismatched IP versions (IPv4 vs IPv6)
             _ => false,
