@@ -1,4 +1,6 @@
 #![recursion_limit = "1024"]
+
+use carbon_white::ip_subnet::IPSubnet;
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
@@ -154,14 +156,14 @@ async fn serve_favicon(
     }
 }
 
-fn parse_ip_whitelist(whitelist: &str) -> Vec<std::net::IpAddr> {
+fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
     if whitelist.is_empty() {
         return Vec::new();
     }
 
     whitelist
         .split(',')
-        .filter_map(|ip| ip.trim().parse().ok())
+        .filter_map(|ip| ip.trim().try_into().ok())
         .collect()
 }
 

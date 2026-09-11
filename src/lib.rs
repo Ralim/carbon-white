@@ -12,6 +12,7 @@ pub mod auth;
 pub mod database;
 #[cfg(feature = "ssr")]
 pub mod file_server;
+pub mod ip_subnet;
 
 pub use app::*;
 
@@ -21,7 +22,7 @@ pub struct AppState {
     pub database: sqlx::SqlitePool,
     pub data_dir: String,
     pub auth_key: String,
-    pub whitelist_ips: Vec<std::net::IpAddr>,
+    pub whitelist_ips: Vec<ip_subnet::IPSubnet>,
 }
 
 #[cfg(feature = "hydrate")]

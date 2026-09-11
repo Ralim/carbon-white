@@ -11,7 +11,6 @@ The _intent_ is that this can be self hosted at home or a workplace easily, then
 - **Metadata** Each document can have metadata like title, part number, manufacturer, version, etc.
 - **Search** Full text search across all metadata fields
 
-
 ## Usage
 
 ### Authentication
@@ -24,7 +23,6 @@ The _intent_ is that this can be self hosted at home or a workplace easily, then
 
 - Use the main search box to find documents
 - Search across titles, part numbers, manufacturers, and other metadata
-
 
 ### Submitting Documents
 
@@ -51,15 +49,18 @@ The _intent_ is that this can be self hosted at home or a workplace easily, then
 ### Installation
 
 1. Install `cargo-leptos`:
+
 ```sh
 cargo install cargo-leptos
 ```
 
 2. Clone the repository:
+
 ```sh
 git clone <repository-url>
 cd carbon-white
 ```
+
 ## Running the Application
 
 ### Container
@@ -85,13 +86,13 @@ When running, the project requires 3 env variables to set for correct performanc
 ```env
 CARBON_DATA_DIR=/path/to/data/directory
 CARBON_AUTH_KEY=your-secret-auth-key
-CARBON_WHITELIST_IPS=127.0.0.1,::1,192.168.1.100
+CARBON_WHITELIST_IPS=127.0.0.1,::1,192.168.1.100,192.168.0.0/24
 RECENT_FILE_COUNT=10
 ```
 
 - `CARBON_DATA_DIR`: Directory where files and database will be stored (defaults to `/tmp/carbon/`)
 - `CARBON_AUTH_KEY`: Secret key for authentication (required for production)
-- `CARBON_WHITELIST_IPS`: Comma-separated list of allowed IP addresses (empty = allow all) for login
+- `CARBON_WHITELIST_IPS`: Comma-separated list of allowed IP addresses (empty = localhost only) for login
 - `RECENT_FILE_COUNT`: Number of recent files to show on the homepage (default 10)
 
 #### Running in Development
@@ -101,6 +102,7 @@ cargo leptos watch
 ```
 
 This will:
+
 - Start the development server on `http://localhost:3000`
 - Watch for file changes and auto-reload
 - Compile both frontend and backend

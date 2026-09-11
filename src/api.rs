@@ -298,29 +298,27 @@ pub async fn handle_auth(
     info!("Authentication attempt from {:?}", client_ip);
 
     // Check IP whitelist if configured
-    if !state.whitelist_ips.is_empty() {
-        // Get client IP from headers with fallback to connection info
+    // Get client IP from headers with fallback to connection info
 
-        match client_ip {
-            Some(ip) => {
-                if !is_ip_whitelisted(ip, &state.whitelist_ips) {
-                    warn!("Authentication attempt from non-whitelisted IP: {}", ip);
-                    return Ok(Json(AuthResponse {
-                        success: false,
-                        message: "Access denied from this IP address".to_string(),
-                        token: None,
-                    }));
-                }
-                info!("IP {} is whitelisted", ip);
-            }
-            None => {
-                warn!("Could not determine client IP for authentication (checked headers and connection info)");
+    match client_ip {
+        Some(ip) => {
+            if !is_ip_whitelisted(ip, &state.whitelist_ips) {
+                warn!("Authentication attempt from non-whitelisted IP: {}", ip);
                 return Ok(Json(AuthResponse {
                     success: false,
-                    message: "Could not verify IP address".to_string(),
+                    message: "Access denied from this IP address".to_string(),
                     token: None,
                 }));
             }
+            info!("IP {} is whitelisted", ip);
+        }
+        None => {
+            warn!("Could not determine client IP for authentication (checked headers and connection info)");
+            return Ok(Json(AuthResponse {
+                success: false,
+                message: "Could not verify IP address".to_string(),
+                token: None,
+            }));
         }
     }
 

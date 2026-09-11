@@ -1,3 +1,5 @@
+use crate::ip_subnet::IPSubnet;
+use crate::AppState;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
@@ -10,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use tracing::{error, info, warn};
-
-use crate::AppState;
 
 static JWT_SECRET: Lazy<Vec<u8>> = Lazy::new(|| {
     env::var("CARBON_AUTH_KEY")
@@ -167,13 +167,18 @@ pub fn validate_auth_key(provided_key: &str, expected_key: &str) -> bool {
         == 0
 }
 
-pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IpAddr]) -> bool {
+pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IPSubnet]) -> bool {
     // If whitelist is empty, allow all IPs
     if whitelist.is_empty() {
-        return true;
+        client_ip.is_loopback()
+    } else {
+        for ip_range in whitelist {
+            if ip_range.contains(&client_ip) {
+                return true;
+            }
+        }
+        false
     }
-
-    whitelist.contains(&client_ip)
 }
 
 pub fn get_client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
