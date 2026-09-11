@@ -29,13 +29,14 @@ use crate::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ip_subnet::IPSubnet;
     use axum::http::{HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn test_ip_whitelist_with_headers() {
         // Whitelist contains 192.168.1.1
-        let whitelist = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))];
+        let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
         let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
 
         // X-Forwarded-For header present
@@ -63,7 +64,7 @@ mod tests {
     #[test]
     fn test_ip_whitelist_with_connect_info_fallback() {
         // Simulate no headers, fallback to ConnectInfo
-        let whitelist = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+        let whitelist = vec![IPSubnet::try_from("127.0.0.1/32").unwrap()];
         let headers = HeaderMap::new();
         let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
         let client_ip = get_client_ip(&headers, connect_info);
@@ -72,10 +73,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_whitelist_empty_allows_any() {
+    fn test_ip_whitelist_empty_allows_localhost() {
         let whitelist = vec![];
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        assert!(is_ip_whitelisted(ip, &whitelist));
+        let local = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert!(is_ip_whitelisted(local, &whitelist));
+        assert!(!is_ip_whitelisted(ip, &whitelist));
     }
 
     #[test]
@@ -298,29 +301,27 @@ pub async fn handle_auth(
     info!("Authentication attempt from {:?}", client_ip);
 
     // Check IP whitelist if configured
-    if !state.whitelist_ips.is_empty() {
-        // Get client IP from headers with fallback to connection info
+    // Get client IP from headers with fallback to connection info
 
-        match client_ip {
-            Some(ip) => {
-                if !is_ip_whitelisted(ip, &state.whitelist_ips) {
-                    warn!("Authentication attempt from non-whitelisted IP: {}", ip);
-                    return Ok(Json(AuthResponse {
-                        success: false,
-                        message: "Access denied from this IP address".to_string(),
-                        token: None,
-                    }));
-                }
-                info!("IP {} is whitelisted", ip);
-            }
-            None => {
-                warn!("Could not determine client IP for authentication (checked headers and connection info)");
+    match client_ip {
+        Some(ip) => {
+            if !is_ip_whitelisted(ip, &state.whitelist_ips) {
+                warn!("Authentication attempt from non-whitelisted IP: {}", ip);
                 return Ok(Json(AuthResponse {
                     success: false,
-                    message: "Could not verify IP address".to_string(),
+                    message: "Access denied from this IP address".to_string(),
                     token: None,
                 }));
             }
+            info!("IP {} is whitelisted", ip);
+        }
+        None => {
+            warn!("Could not determine client IP for authentication (checked headers and connection info)");
+            return Ok(Json(AuthResponse {
+                success: false,
+                message: "Could not verify IP address".to_string(),
+                token: None,
+            }));
         }
     }
 

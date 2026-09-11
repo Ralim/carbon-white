@@ -1,4 +1,6 @@
 #![recursion_limit = "1024"]
+
+use carbon_white::ip_subnet::IPSubnet;
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
@@ -22,8 +24,8 @@ async fn main() {
         env::var("CARBON_DATA_DIR").unwrap_or_else(|_| "/tmp/carbon/".to_string());
     let carbon_auth_key = env::var("CARBON_AUTH_KEY").expect("CARBON_AUTH_KEY must be set");
     let carbon_whitelist_ips = env::var("CARBON_WHITELIST_IPS").unwrap_or_else(|_| {
-        warn!("CARBON_WHITELIST_IPS not set, allowing all IPs");
-        "".to_string()
+        warn!("CARBON_WHITELIST_IPS not set");
+        "127.0.0.1,::1".to_string()
     });
 
     info!("Carbon data directory: `{}`", carbon_data_dir);
@@ -154,14 +156,14 @@ async fn serve_favicon(
     }
 }
 
-fn parse_ip_whitelist(whitelist: &str) -> Vec<std::net::IpAddr> {
+fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
     if whitelist.is_empty() {
         return Vec::new();
     }
 
     whitelist
         .split(',')
-        .filter_map(|ip| ip.trim().parse().ok())
+        .filter_map(|ip| ip.trim().try_into().ok())
         .collect()
 }
 
