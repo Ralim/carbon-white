@@ -569,7 +569,7 @@ pub async fn handle_submit(
     // Calculate file SHA256
     let mut hasher = Sha256::new();
     hasher.update(&file_bytes);
-    let file_hash = format!("{:x}", hasher.finalize());
+    let file_hash = hex::encode(hasher.finalize());
 
     info!(
         "Processing file upload: {} (SHA256: {})",

@@ -265,6 +265,7 @@ dependencies = [
  "futures-util",
  "gloo-net 0.7.0",
  "gloo-timers",
+ "hex",
  "js-sys",
  "jsonwebtoken",
  "leptos",

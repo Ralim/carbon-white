@@ -45,6 +45,7 @@ urlencoding = "2.1"
 gloo-net = { version = "0.7", features = ["http"], optional = true }
 gloo-timers = "0.4"
 thiserror = "2.0"
+hex = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3.0"
