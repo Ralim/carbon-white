@@ -84,16 +84,16 @@ mod test_ip_subnet {
     #[test]
     fn test_contains() {
         let subnet = IPSubnet::try_from("192.168.0.0/24").unwrap();
-        assert!(subnet.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 10))));
-        assert!(!subnet.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
-        assert!(!subnet.contains(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))));
-        assert!(!subnet.contains(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2))));
+        assert!(subnet.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 0, 10))));
+        assert!(!subnet.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
+        assert!(!subnet.contains(&IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))));
+        assert!(!subnet.contains(&IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2))));
     }
 
     #[test]
     fn test_contains_ipv6() {
         let subnet = IPSubnet::try_from("2001:db8::/32").unwrap();
-        assert!(subnet.contains(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0))));
-        assert!(!subnet.contains(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0))));
+        assert!(subnet.contains(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0))));
+        assert!(!subnet.contains(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0))));
     }
 }

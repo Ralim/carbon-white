@@ -267,9 +267,9 @@ mod test_auth {
 
     #[test]
     fn test_is_ip_whitelisted() {
-        let whitelist = vec![
-            IpAddr::from_str("192.168.1.1").unwrap(),
-            IpAddr::from_str("::1").unwrap(),
+        let whitelist: Vec<IPSubnet> = vec![
+            IPSubnet::try_from("192.168.1.1/32").unwrap(),
+            IPSubnet::try_from("::1/128").unwrap(),
         ];
 
         // Test whitelisted IPs
@@ -288,8 +288,12 @@ mod test_auth {
             &whitelist
         ));
 
-        // Test empty whitelist (should allow all)
+        // Test empty whitelist (should allow only localhost)
         assert!(is_ip_whitelisted(
+            IpAddr::from_str("127.0.0.1").unwrap(),
+            &[]
+        ));
+        assert!(!is_ip_whitelisted(
             IpAddr::from_str("192.168.1.2").unwrap(),
             &[]
         ));
