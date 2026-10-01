@@ -9,10 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-use once_cell::sync::Lazy;
 use std::env;
-use std::io::Write;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
@@ -57,6 +56,84 @@ pub struct SubmitResponse {
     pub success: bool,
     pub message: String,
     pub file_sha256: Option<String>,
+}
+
+/// Maximum accepted upload size, enforced after the multipart body is decoded.
+const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+
+/// Upper bound on a stored filename. Leaves headroom under the common 255-byte
+/// filesystem limit once the hash directory prefix is added.
+const MAX_FILENAME_LEN: usize = 200;
+
+/// Reduces a client-supplied upload filename to a single safe path component.
+///
+/// The filename arrives from a multipart `Content-Disposition` header and is
+/// therefore fully attacker controlled. Stripping every directory component
+/// prevents `../` traversal and absolute-path escapes, replacing characters that
+/// are unsafe on common filesystems keeps the name portable, and the fallback
+/// guarantees the result is never empty or a relative-directory marker.
+///
+/// The original name is still recorded in the database for display purposes; only
+/// the on-disk path is derived from this value.
+fn sanitize_upload_filename(raw: &str) -> String {
+    // `rsplit` on both separators so that Windows-style paths are handled too.
+    let basename = raw.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+
+    let mut cleaned: String = basename
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '"' | '\'' | '<' | '>' | '|' | ':' | '*' | '?' | '\\' | '/'
+                )
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // Leading dots would produce hidden files or the relative markers `.` / `..`.
+    cleaned = cleaned.trim().trim_start_matches('.').trim().to_string();
+
+    if cleaned.is_empty() {
+        return "upload".to_string();
+    }
+
+    // Truncate on a char boundary so we never emit invalid UTF-8.
+    if cleaned.len() > MAX_FILENAME_LEN {
+        let mut end = MAX_FILENAME_LEN;
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned.truncate(end);
+    }
+
+    if cleaned.is_empty() {
+        "upload".to_string()
+    } else {
+        cleaned
+    }
+}
+
+impl From<database::Document> for SearchResult {
+    fn from(doc: database::Document) -> Self {
+        Self {
+            title: doc.title,
+            part_number: doc.part_number.unwrap_or_default(),
+            manufacturer: doc.manufacturer.unwrap_or_default(),
+            document_id: doc.document_id.unwrap_or_default(),
+            document_version: doc.document_version.unwrap_or_default(),
+            package_marking: doc.package_marking.unwrap_or_default(),
+            device_address: doc.device_address.unwrap_or_default(),
+            notes: doc.notes.unwrap_or_default(),
+            storage_date: doc.storage_date,
+            original_file_name: doc.original_file_name,
+            file_sha256: doc.file_sha256,
+        }
+    }
 }
 
 pub fn create_api_routes() -> Router<AppState> {
@@ -132,6 +209,7 @@ pub async fn handle_auth(
 }
 
 pub async fn handle_auth_status(
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, StatusCode> {
     let authenticated = extract_token_from_headers(&headers)
@@ -149,65 +227,37 @@ pub async fn handle_search(
     info!("Search request for query: '{}'", query.q);
 
     // If no search query provided, return latest N files (from env or default 10)
-    static RECENT_FILE_COUNT: Lazy<u32> = Lazy::new(|| {
+    static RECENT_FILE_COUNT: LazyLock<u32> = LazyLock::new(|| {
         env::var("RECENT_FILE_COUNT")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(10)
     });
     if query.q.trim().is_empty() {
-        match database::get_latest_documents(&state.database, *RECENT_FILE_COUNT).await {
+        return match database::get_latest_documents(&state.database, *RECENT_FILE_COUNT).await {
             Ok(documents) => {
-                let results: Vec<SearchResult> = documents
-                    .into_iter()
-                    .map(|doc| SearchResult {
-                        title: doc.title,
-                        part_number: doc.part_number.unwrap_or_default(),
-                        manufacturer: doc.manufacturer.unwrap_or_default(),
-                        document_id: doc.document_id.unwrap_or_default(),
-                        document_version: doc.document_version.unwrap_or_default(),
-                        package_marking: doc.package_marking.unwrap_or_default(),
-                        device_address: doc.device_address.unwrap_or_default(),
-                        notes: doc.notes.unwrap_or_default(),
-                        storage_date: doc.storage_date,
-                        original_file_name: doc.original_file_name,
-                        file_sha256: doc.file_sha256,
-                    })
-                    .collect();
+                let results: Vec<SearchResult> =
+                    documents.into_iter().map(SearchResult::from).collect();
 
                 let duration = start_time.elapsed().as_millis();
                 info!("Returned {} latest files in {}ms", results.len(), duration);
 
-                return Ok(Json(SearchResponse {
+                Ok(Json(SearchResponse {
                     results,
                     duration_ms: duration,
-                }));
+                }))
             }
             Err(e) => {
                 error!("Database error getting latest documents: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
-        }
+        };
     }
 
     match database::search_documents(&state.database, &query.q).await {
         Ok(documents) => {
-            let results: Vec<SearchResult> = documents
-                .into_iter()
-                .map(|doc| SearchResult {
-                    title: doc.title,
-                    part_number: doc.part_number.unwrap_or_default(),
-                    manufacturer: doc.manufacturer.unwrap_or_default(),
-                    document_id: doc.document_id.unwrap_or_default(),
-                    document_version: doc.document_version.unwrap_or_default(),
-                    package_marking: doc.package_marking.unwrap_or_default(),
-                    device_address: doc.device_address.unwrap_or_default(),
-                    notes: doc.notes.unwrap_or_default(),
-                    storage_date: doc.storage_date,
-                    original_file_name: doc.original_file_name,
-                    file_sha256: doc.file_sha256,
-                })
-                .collect();
+            let results: Vec<SearchResult> =
+                documents.into_iter().map(SearchResult::from).collect();
 
             let duration = start_time.elapsed().as_millis();
             info!(
@@ -233,17 +283,7 @@ pub async fn handle_submit(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<SubmitResponse>, StatusCode> {
-    use crate::auth::{extract_token_from_headers, verify_jwt_token};
-
     info!("File submission request received");
-    info!("Request headers: {:?}", headers);
-
-    // Check Content-Type header specifically
-    if let Some(content_type) = headers.get("content-type") {
-        info!("Content-Type: {:?}", content_type);
-    } else {
-        warn!("No Content-Type header found");
-    }
 
     // Check authentication
     let token = match extract_token_from_headers(&headers) {
@@ -258,7 +298,7 @@ pub async fn handle_submit(
         }
     };
 
-    if let Err(e) = verify_jwt_token(&token) {
+    if let Err(e) = verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token) {
         warn!("Invalid token for file submission: {}", e);
         return Ok(Json(SubmitResponse {
             success: false,
@@ -271,15 +311,11 @@ pub async fn handle_submit(
     let mut file_data: Option<(String, Vec<u8>)> = None;
 
     // Process multipart form data with detailed error handling
-    info!("Starting multipart field processing");
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         error!("Error reading multipart field: {}", e);
-        error!("Headers received: {:?}", headers);
-        error!("Error details: {:?}", e);
         StatusCode::BAD_REQUEST
     })? {
         let name = field.name().unwrap_or("").to_string();
-        info!("Processing field: '{}'", name);
 
         if name == "file" {
             let filename = field.file_name().unwrap_or("unknown").to_string();
@@ -292,16 +328,17 @@ pub async fn handle_submit(
             // Read file data in chunks to handle large files better
             let data = field.bytes().await.map_err(|e| {
                 error!("Error reading file data: {}", e);
-                error!("Field content type: {:?}", content_type);
                 error!("Filename: {}", filename);
                 StatusCode::BAD_REQUEST
             })?;
 
-            if data.len() > 100 * 1024 * 1024 {
-                // 100MB limit
+            if data.len() > MAX_FILE_SIZE {
                 return Ok(Json(SubmitResponse {
                     success: false,
-                    message: "File size exceeds 100MB limit".to_string(),
+                    message: format!(
+                        "File size exceeds {}MB limit",
+                        MAX_FILE_SIZE / (1024 * 1024)
+                    ),
                     file_sha256: None,
                 }));
             }
@@ -309,13 +346,10 @@ pub async fn handle_submit(
             info!("File data size: {} bytes", data.len());
             file_data = Some((filename, data.to_vec()));
         } else {
-            let content_type = field.content_type().map(|ct| ct.to_string());
             let value = field.text().await.map_err(|e| {
                 error!("Error reading form field {}: {}", name, e);
-                error!("Field content type: {:?}", content_type);
                 StatusCode::BAD_REQUEST
             })?;
-            info!("Field '{}' = '{}'", name, value);
             form_data.insert(name, value);
         }
     }
@@ -359,9 +393,12 @@ pub async fn handle_submit(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Write file to disk
-    let file_path = file_dir.join(&original_filename);
-    let mut file = match std::fs::File::create(&file_path) {
+    // The uploaded name is attacker controlled, so only ever use the sanitized
+    // basename for the on-disk path. The raw name is kept in the database for
+    // display only.
+    let stored_filename = sanitize_upload_filename(&original_filename);
+    let file_path = file_dir.join(&stored_filename);
+    let mut file = match tokio::fs::File::create(&file_path).await {
         Ok(file) => file,
         Err(e) => {
             error!("Failed to create file: {}", e);
@@ -369,8 +406,9 @@ pub async fn handle_submit(
         }
     };
 
-    if let Err(e) = file.write_all(&file_bytes) {
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &file_bytes).await {
         error!("Failed to write file data: {}", e);
+        let _ = tokio::fs::remove_file(&file_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -403,7 +441,7 @@ pub async fn handle_submit(
         Err(e) => {
             error!("Failed to store document in database: {}", e);
             // Clean up the file if database insertion fails
-            let _ = std::fs::remove_file(&file_path);
+            let _ = tokio::fs::remove_file(&file_path).await;
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -530,14 +568,16 @@ pub async fn handle_update_document(
             match database::update_document_metadata(
                 &state.database,
                 &sha256,
-                &update_request.title,
-                update_request.part_number.as_deref(),
-                update_request.manufacturer.as_deref(),
-                update_request.document_id.as_deref(),
-                update_request.document_version.as_deref(),
-                update_request.package_marking.as_deref(),
-                update_request.device_address.as_deref(),
-                update_request.notes.as_deref(),
+                &database::DocumentMetadataUpdate {
+                    title: &update_request.title,
+                    part_number: update_request.part_number.as_deref(),
+                    manufacturer: update_request.manufacturer.as_deref(),
+                    document_id: update_request.document_id.as_deref(),
+                    document_version: update_request.document_version.as_deref(),
+                    package_marking: update_request.package_marking.as_deref(),
+                    device_address: update_request.device_address.as_deref(),
+                    notes: update_request.notes.as_deref(),
+                },
             )
             .await
             {
