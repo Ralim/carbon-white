@@ -1,0 +1,177 @@
+name: Publish Docker image (manual)
+
+# Manually triggered from the Actions tab. The branch to build is chosen by the
+# person running the workflow rather than by whatever was last pushed, so a
+# release can be cut from any branch without merging it to main first.
+#
+# Only triggers once this file is present on the repository's default branch;
+# GitHub only offers the "Run workflow" button for workflows it can see there.
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to build and publish
+        required: true
+        type: string
+
+# Least privilege by default. The job that actually pushes opts in to the extra
+# scopes it needs, so the permission check below cannot write anything.
+permissions:
+  contents: read
+
+# Two runs for the same branch must not race each other into the registry.
+concurrency:
+  group: docker-publish-${{ inputs.branch }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # workflow_dispatch has no built-in permission gate -- GitHub lets anyone who
+  # can see the Actions tab press the button. The check has to be explicit.
+  authorize:
+    name: Check write access
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+      detail: ${{ steps.check.outputs.detail }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -uo pipefail
+
+          # `github.actor` is the person who pressed the button, so this cannot
+          # be set by the caller. The permission is looked up live rather than
+          # inferred from repository settings, which only cover some roles.
+          #
+          # This fails closed: if the lookup errors for any reason, the answer
+          # is no. A deny from a broken check is recoverable, a publish from
+          # one is not.
+          if ! permission="$(
+            gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission' 2>/dev/null
+          )" || [ -z "${permission}" ]; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "detail=could not determine the access level of ${ACTOR}; denying" >> "$GITHUB_OUTPUT"
+            echo "::error::Unable to determine repository access for ${ACTOR}. Denying."
+            exit 1
+          fi
+
+          # `admin`, `maintain` and `write` are the roles that can already push
+          # to this repository, so none of them gains anything new here.
+          case "${permission}" in
+            admin|maintain|write)
+              echo "allowed=true" >> "$GITHUB_OUTPUT"
+              echo "detail=${ACTOR} has ${permission} access" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "allowed=false" >> "$GITHUB_OUTPUT"
+              echo "detail=${ACTOR} has '${permission}' access, write is required" >> "$GITHUB_OUTPUT"
+              echo "::error::${ACTOR} has '${permission}' access to ${REPO}. Write access is required to publish an image."
+              exit 1
+              ;;
+          esac
+
+  build-and-push:
+    name: Build and push
+    needs: authorize
+    # Redundant with the failure above, but keeps the intent visible next to the
+    # job it protects.
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      # The input reaches `actions/checkout` as a value rather than being
+      # interpolated into a shell command, but it is still validated first: this
+      # rejects tags, pull request refs, and raw object ids, so the build can
+      # only ever come from a real branch.
+      - name: Resolve branch
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -uo pipefail
+
+          if ! printf '%s' "${BRANCH}" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "::error::'${BRANCH}' is not a valid branch name."
+            exit 1
+          fi
+
+          if ! gh api "repos/${REPO}/branches/${BRANCH}" --jq '.name' >/dev/null 2>&1; then
+            echo "::error::Branch '${BRANCH}' does not exist in ${REPO}."
+            exit 1
+          fi
+
+          echo "name=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.name }}
+          fetch-depth: 1
+
+      # The tag is the commit the branch pointed at when this run started, not
+      # `github.sha`. For a manually dispatched workflow those differ: the
+      # former is whatever was selected in the Actions dropdown, the latter is
+      # the branch actually requested through the input above.
+      - name: Resolve image name and commit
+        id: image
+        run: |
+          set -euo pipefail
+
+          sha="$(git rev-parse HEAD)"
+
+          # GHCR requires a fully lowercase image path, but repository names may
+          # contain uppercase characters.
+          repository="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+
+          {
+            echo "sha=${sha}"
+            echo "name=${REGISTRY}/${repository}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Exactly one tag: the full commit SHA. No version tag and no moving
+      # `latest` tag, so an image that is running is always traceable to an
+      # exact commit and a rebuild of the same commit is reproducible.
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.image.outputs.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarise
+        run: |
+          echo "Published ${{ steps.image.outputs.name }}:${{ steps.image.outputs.sha }}"
+          echo "from branch '${{ steps.target.outputs.name }}'"
