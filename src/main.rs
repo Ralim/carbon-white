@@ -1,5 +1,6 @@
 #![recursion_limit = "1024"]
 
+#[cfg(feature = "ssr")]
 use carbon_white::ip_subnet::IPSubnet;
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -116,12 +117,28 @@ pub fn main() {
 async fn serve_favicon(
     request: axum::extract::Request,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    use leptos::prelude::*;
+
+    // Resolve the site root from the build-time configuration and delegate.
+    let site_root = get_configuration(None).unwrap().leptos_options.site_root;
+    serve_favicon_at(request, site_root.as_ref()).await
+}
+
+/// Serves a static asset from `site_root`.
+///
+/// Split out from [`serve_favicon`] so tests can point at a temporary directory
+/// directly instead of mutating process-global environment state, which is both
+/// unsafe under edition 2024 and racy across concurrently running tests.
+#[cfg(feature = "ssr")]
+async fn serve_favicon_at(
+    request: axum::extract::Request,
+    site_root: &str,
+) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
     use axum::{
         body::Body,
         http::{StatusCode, header},
         response::Response,
     };
-    use leptos::prelude::*;
     use std::path::Path;
     use tokio::fs;
 
@@ -129,14 +146,11 @@ async fn serve_favicon(
     let path = request.uri().path();
     let filename = path.trim_start_matches('/');
 
-    // Get site root from leptos options
-    let conf = get_configuration(None).unwrap();
-    let site_root = conf.leptos_options.site_root;
-    let file_path = Path::new(site_root.as_ref()).join(filename);
+    let file_path = Path::new(site_root).join(filename);
 
     match fs::read(&file_path).await {
         Ok(content) => {
-            let mime_type = match filename.split('.').next_back() {
+            let mime_type = match filename.rsplit('.').next() {
                 Some("ico") => "image/x-icon",
                 Some("png") => "image/png",
                 Some("webmanifest") => "application/manifest+json",
@@ -156,6 +170,11 @@ async fn serve_favicon(
     }
 }
 
+/// Parses a comma-separated whitelist of IPs or CIDR ranges.
+///
+/// Only the SSR binary uses this, so it is gated out of a client-only build
+/// where it would otherwise be reported as dead code.
+#[cfg(feature = "ssr")]
 fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
     if whitelist.is_empty() {
         return Vec::new();
@@ -804,9 +823,6 @@ mod tests {
         )
         .unwrap();
 
-        // Mock leptos configuration for testing
-        std::env::set_var("LEPTOS_SITE_ROOT", &site_root);
-
         // Test serving favicon.ico
         let ico_request = Request::builder()
             .method(Method::GET)
@@ -814,7 +830,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(ico_request).await;
+        let result = serve_favicon_at(ico_request, &site_root).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -835,7 +851,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(png_request).await;
+        let result = serve_favicon_at(png_request, &site_root).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -856,7 +872,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(manifest_request).await;
+        let result = serve_favicon_at(manifest_request, &site_root).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -877,12 +893,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(not_found_request).await;
+        let result = serve_favicon_at(not_found_request, &site_root).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
-
-        // Clean up
-        std::env::remove_var("LEPTOS_SITE_ROOT");
     }
 
     #[test]

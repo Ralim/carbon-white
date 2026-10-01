@@ -48,7 +48,6 @@ pub fn AllFilesPage() -> impl IntoView {
     // Reload the listing whenever the requested page changes.
     #[cfg(feature = "hydrate")]
     Effect::new(move |_| {
-        use crate::shared::AuthStatusResponse;
         use leptos::task::spawn_local;
 
         let requested_page = page.get();
@@ -65,10 +64,8 @@ pub fn AllFilesPage() -> impl IntoView {
 
             // A failure here only hides the "Edit" actions; the listing itself
             // is public, so do not surface it as a page-level error.
-            if let Ok(response) = auth_request.send().await {
-                if let Ok(status) = response.json::<AuthStatusResponse>().await {
-                    _set_is_authenticated.set(status.authenticated);
-                }
+            if let Some(authenticated) = fetch_auth_status(auth_request).await {
+                _set_is_authenticated.set(authenticated);
             }
 
             match fetch_page(requested_page).await {
@@ -246,6 +243,20 @@ fn Pagination(
             </nav>
         </Show>
     }
+}
+
+/// Asks the server whether the supplied request carries a valid session.
+///
+/// Returns `None` on any build, transport or decoding failure, so callers can
+/// treat an unknown auth state as "not authenticated" without branching on
+/// errors.
+#[cfg(feature = "hydrate")]
+async fn fetch_auth_status(request: gloo_net::http::RequestBuilder) -> Option<bool> {
+    use crate::shared::AuthStatusResponse;
+
+    let response = request.build().ok()?.send().await.ok()?;
+    let status = response.json::<AuthStatusResponse>().await.ok()?;
+    Some(status.authenticated)
 }
 
 /// Reads the auth token from `localStorage`.
