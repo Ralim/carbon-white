@@ -6,10 +6,10 @@ use carbon_white::ip_subnet::IPSubnet;
 async fn main() {
     #[allow(unused_imports)] // Required for into_make_service_with_connect_info trait method
     use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
-    use axum::{extract::DefaultBodyLimit, Router};
+    use axum::{Router, extract::DefaultBodyLimit};
     use carbon_white::*;
     use leptos::prelude::*;
-    use leptos_axum::{generate_route_list, LeptosRoutes};
+    use leptos_axum::{LeptosRoutes, generate_route_list};
     use std::env;
     use std::net::SocketAddr;
     use tower_http::services::ServeDir;
@@ -118,7 +118,7 @@ async fn serve_favicon(
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
     use axum::{
         body::Body,
-        http::{header, StatusCode},
+        http::{StatusCode, header},
         response::Response,
     };
     use leptos::prelude::*;
@@ -171,7 +171,7 @@ fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
 #[cfg(feature = "ssr")]
 mod tests {
     use super::*;
-    use carbon_white::{api, database, file_server, App, AppState};
+    use carbon_white::{App, AppState, api, database, file_server};
     use leptos::prelude::get_configuration;
     use leptos_axum::generate_route_list;
     use std::net::SocketAddr;
@@ -818,13 +818,15 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("image/x-icon"));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("image/x-icon")
+        );
 
         // Test serving PNG favicon
         let png_request = Request::builder()
@@ -837,13 +839,15 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("image/png"));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("image/png")
+        );
 
         // Test serving webmanifest
         let manifest_request = Request::builder()
@@ -856,13 +860,15 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("application/manifest+json"));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("application/manifest+json")
+        );
 
         // Test 404 for non-existent file
         let not_found_request = Request::builder()

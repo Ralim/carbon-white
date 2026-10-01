@@ -1,12 +1,12 @@
-use crate::ip_subnet::IPSubnet;
 use crate::AppState;
+use crate::ip_subnet::IPSubnet;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use tracing::{error, info, warn};
@@ -227,7 +227,7 @@ pub fn get_client_ip(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> O
 #[cfg(test)]
 mod test_auth {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::str::FromStr;
 
     #[test]

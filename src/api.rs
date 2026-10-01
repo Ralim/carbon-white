@@ -1,9 +1,9 @@
 use axum::{
+    Router,
     extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post, put},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,13 +16,13 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::{
+    AppState,
     auth::{
-        create_jwt_token_with_secret, extract_token_from_headers, get_client_ip, is_ip_whitelisted,
-        validate_auth_key, verify_jwt_token_with_secret, AuthRequest, AuthResponse,
+        AuthRequest, AuthResponse, create_jwt_token_with_secret, extract_token_from_headers,
+        get_client_ip, is_ip_whitelisted, validate_auth_key, verify_jwt_token_with_secret,
     },
     database::{self, NewDocument},
     shared::AuthStatusResponse,
-    AppState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -172,7 +172,9 @@ pub async fn handle_auth(
             info!("IP {} is whitelisted", ip);
         }
         None => {
-            warn!("Could not determine client IP for authentication (checked headers and connection info)");
+            warn!(
+                "Could not determine client IP for authentication (checked headers and connection info)"
+            );
             return Ok(Json(AuthResponse {
                 success: false,
                 message: "Could not verify IP address".to_string(),

@@ -1,4 +1,4 @@
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
+use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase};
 use std::path::Path;
 use tracing::info;
 
@@ -470,7 +470,7 @@ pub struct DocumentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     pub struct TestDb {
         pub pool: SqlitePool,
@@ -701,9 +701,11 @@ mod tests {
             .unwrap()
             .expect("document should be inserted");
 
-        assert!(document_exists_by_sha256(&test_db.pool, "exists_test_hash")
-            .await
-            .unwrap());
+        assert!(
+            document_exists_by_sha256(&test_db.pool, "exists_test_hash")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

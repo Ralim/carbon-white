@@ -1,17 +1,17 @@
 use axum::{
+    Router,
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
     routing::get,
-    Router,
 };
 use mime_guess::MimeGuess;
 use std::path::Path as StdPath;
 use tokio::fs;
 use tracing::{error, info, warn};
 
-use crate::{database, AppState};
+use crate::{AppState, database};
 
 pub fn create_file_routes() -> Router<AppState> {
     Router::new().route("/{sha256}", get(serve_file))
