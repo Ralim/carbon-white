@@ -8,6 +8,14 @@ on:
   pull_request:
     branches: [main]
 
+# Stop a superseded run on the same ref from consuming a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     name: Build with cargo leptos
@@ -21,20 +29,44 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - uses: cargo-bins/cargo-binstall@main
 
       - name: Install cargo-leptos
         run: cargo binstall cargo-leptos --no-confirm
 
-      - name: Install wasm target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Cache cargo and cargo-leptos artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint (host / ssr)
+        run: cargo clippy --all-targets --features ssr -- -D warnings
+
+      - name: Lint (wasm / hydrate)
+        run: cargo clippy --lib --features hydrate --target wasm32-unknown-unknown -- -D warnings
+      - name: Test (default features)
+        run: cargo test
+
+      - name: Test (ssr, all targets)
+        run: cargo test --features ssr --all-targets
 
       - name: Build Carbon-White
         run: cargo leptos build
 
-      - name: Test
-        run: cargo test
-
-      - name: Test lib
-        run: CARBON_AUTH_KEY="test" cargo test --features ssr --lib
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: carbon-white-site
+          path: target/site
+          retention-days: 7
