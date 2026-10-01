@@ -152,17 +152,26 @@ pub async fn insert_or_update_document(
     Ok(result.last_insert_rowid())
 }
 
+/// Metadata fields that can be edited after a document is uploaded.
+///
+/// Bundling the optional fields keeps `update_document_metadata` from growing an
+/// argument per column.
+#[derive(Debug, Default, Clone)]
+pub struct DocumentMetadataUpdate<'a> {
+    pub title: &'a str,
+    pub part_number: Option<&'a str>,
+    pub manufacturer: Option<&'a str>,
+    pub document_id: Option<&'a str>,
+    pub document_version: Option<&'a str>,
+    pub package_marking: Option<&'a str>,
+    pub device_address: Option<&'a str>,
+    pub notes: Option<&'a str>,
+}
+
 pub async fn update_document_metadata(
     pool: &SqlitePool,
     sha256: &str,
-    title: &str,
-    part_number: Option<&str>,
-    manufacturer: Option<&str>,
-    document_id: Option<&str>,
-    document_version: Option<&str>,
-    package_marking: Option<&str>,
-    device_address: Option<&str>,
-    notes: Option<&str>,
+    update: &DocumentMetadataUpdate<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
@@ -179,14 +188,14 @@ pub async fn update_document_metadata(
         WHERE file_sha256 = ?
         "#,
     )
-    .bind(title)
-    .bind(part_number)
-    .bind(manufacturer)
-    .bind(document_id)
-    .bind(document_version)
-    .bind(package_marking)
-    .bind(device_address)
-    .bind(notes)
+    .bind(update.title)
+    .bind(update.part_number)
+    .bind(update.manufacturer)
+    .bind(update.document_id)
+    .bind(update.document_version)
+    .bind(update.package_marking)
+    .bind(update.device_address)
+    .bind(update.notes)
     .bind(sha256)
     .execute(pool)
     .await?;
@@ -354,7 +363,6 @@ pub struct DocumentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::{tempdir, TempDir};
 
     pub struct TestDb {
@@ -640,14 +648,16 @@ mod tests {
         update_document_metadata(
             &test_db.pool,
             "update_test_hash",
-            "Updated Title",
-            Some("PN002"),
-            Some("Updated Mfg"),
-            Some("DOC002"),
-            Some("2.0"),
-            Some("BGA64"),
-            Some("0x49"),
-            Some("Updated notes"),
+            &DocumentMetadataUpdate {
+                title: "Updated Title",
+                part_number: Some("PN002"),
+                manufacturer: Some("Updated Mfg"),
+                document_id: Some("DOC002"),
+                document_version: Some("2.0"),
+                package_marking: Some("BGA64"),
+                device_address: Some("0x49"),
+                notes: Some("Updated notes"),
+            },
         )
         .await
         .unwrap();
@@ -676,14 +686,10 @@ mod tests {
         update_document_metadata(
             &test_db.pool,
             "update_test_hash",
-            "Title Only",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &DocumentMetadataUpdate {
+                title: "Title Only",
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

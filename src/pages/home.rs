@@ -1,3 +1,7 @@
+// Signal setters are only ever mutated from `hydrate`-gated effects and event
+// handlers, so they read as unused in an SSR-only build.
+#![cfg_attr(not(feature = "hydrate"), allow(unused_variables))]
+
 use crate::{components::header::Header, pages::footer::Footer};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};

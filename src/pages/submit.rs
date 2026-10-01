@@ -1,9 +1,30 @@
+// Signal setters are only ever mutated from `hydrate`-gated effects and event
+// handlers, so they read as unused in an SSR-only build.
+#![cfg_attr(not(feature = "hydrate"), allow(unused_variables))]
+
 use crate::{components::header::Header, pages::footer::Footer};
 use leptos::prelude::*;
 use leptos_router::{components::A, hooks::use_navigate};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "hydrate")]
 use web_sys::FormData;
+
+/// Field values captured at submit time.
+///
+/// The `File` itself is deliberately not part of this struct: it is not
+/// `Send`/`Sync`, so it is read straight from the input element in the handler.
+#[cfg(feature = "hydrate")]
+#[derive(Clone)]
+struct SubmitFormFields {
+    title: String,
+    part_number: String,
+    manufacturer: String,
+    document_id: String,
+    document_version: String,
+    package_marking: String,
+    device_address: String,
+    notes: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubmitResponse {
@@ -19,12 +40,16 @@ pub fn SubmitPage() -> impl IntoView {
     let (error_message, set_error_message) = signal(Option::<String>::None);
     let (success_message, set_success_message) = signal(Option::<String>::None);
 
+    // Hooks must be called during component setup, not from inside an effect.
+    let navigate = use_navigate();
+
     // Check authentication on page load
     #[cfg(feature = "hydrate")]
     Effect::new(move |_| {
         use crate::shared::AuthStatusResponse;
         use leptos::task::spawn_local;
-        let navigate = use_navigate();
+
+        let navigate = navigate.clone();
         spawn_local(async move {
             // Get auth token from localStorage
             let token = if let Some(window) = web_sys::window() {
@@ -80,64 +105,7 @@ pub fn SubmitPage() -> impl IntoView {
     let (device_address, set_device_address) = signal(String::new());
     let (notes, set_notes) = signal(String::new());
 
-    let navigate = use_navigate();
-
-    // Check authentication on page load
-    #[cfg(feature = "hydrate")]
-    Effect::new(move |_| {
-        use leptos::task::spawn_local;
-
-        let navigate = navigate.clone();
-        spawn_local(async move {
-            // Get auth token from localStorage
-            let token = if let Some(window) = web_sys::window() {
-                if let Some(storage) = window.local_storage().unwrap_or(None) {
-                    storage.get_item("carbon_auth_token").unwrap_or(None)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let mut request = gloo_net::http::Request::get("/api/auth/status");
-
-            // Add Authorization header if token exists
-            if let Some(token) = token {
-                request = request.header("Authorization", &format!("Bearer {}", token));
-            }
-
-            match request.send().await {
-                Ok(response) => {
-                    if response.status() == 200 {
-                        set_is_authenticated.set(true);
-                    } else {
-                        // Redirect to login if not authenticated
-                        navigate("/login", Default::default());
-                    }
-                }
-                Err(_) => {
-                    // Redirect to login on error
-                    navigate("/login", Default::default());
-                }
-            }
-        });
-    });
-
     // Instead of passing a struct with a File (which is not Send/Sync), pass only the fields needed for the request.
-    #[derive(Clone)]
-    struct SubmitFormFields {
-        title: String,
-        part_number: String,
-        manufacturer: String,
-        document_id: String,
-        document_version: String,
-        package_marking: String,
-        device_address: String,
-        notes: String,
-        // Instead of passing the File, pass its index and extract it synchronously in the event handler.
-    }
-
     view! {
         <div class="app-container">
             <Header is_authenticated/>

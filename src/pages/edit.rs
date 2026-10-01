@@ -1,4 +1,10 @@
-use crate::{components::header::Header, pages::footer::Footer, shared::AuthStatusResponse};
+// Signal setters are only ever mutated from `hydrate`-gated effects and event
+// handlers, so they read as unused in an SSR-only build.
+#![cfg_attr(not(feature = "hydrate"), allow(unused_variables))]
+
+#[cfg(feature = "hydrate")]
+use crate::shared::AuthStatusResponse;
+use crate::{components::header::Header, pages::footer::Footer};
 use leptos::prelude::*;
 use leptos_router::{components::A, hooks::use_navigate, hooks::use_params_map};
 use serde::{Deserialize, Serialize};
@@ -42,6 +48,8 @@ pub struct UpdateDocumentRequest {
 pub fn EditPage() -> impl IntoView {
     let params = use_params_map();
     let navigate = use_navigate();
+    // Held in a `StoredValue` so the submit handler can navigate from inside a
+    // spawned async task without capturing the whole reactive scope.
     let navigate_stored = StoredValue::new(navigate.clone());
 
     let (is_authenticated, _set_is_authenticated) = signal(false);
