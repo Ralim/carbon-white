@@ -1,4 +1,4 @@
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
+use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase};
 use std::path::Path;
 use tracing::info;
 
@@ -121,17 +121,24 @@ pub struct NewDocument {
     pub file_path: String,
 }
 
-pub async fn insert_or_update_document(
+/// Stores a new document unless its file is already on file.
+///
+/// Returns `Ok(Some(id))` when the row was inserted, or `Ok(None)` when a
+/// document with the same `file_sha256` already exists. `ON CONFLICT DO NOTHING`
+/// surfaces the clash as "nothing was written" rather than as an error, which
+/// keeps this correct when two uploads of the same file race each other.
+pub async fn insert_document_if_absent(
     pool: &SqlitePool,
     document: NewDocument,
-) -> Result<i64, sqlx::Error> {
+) -> Result<Option<i64>, sqlx::Error> {
     let result = sqlx::query(
         r#"
-        INSERT OR REPLACE INTO documents (
+        INSERT INTO documents (
             title, part_number, manufacturer, document_id, document_version,
             package_marking, device_address, notes, storage_date,
             original_file_name, file_sha256, file_path, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(file_sha256) DO NOTHING
         "#,
     )
     .bind(&document.title)
@@ -149,7 +156,11 @@ pub async fn insert_or_update_document(
     .execute(pool)
     .await?;
 
-    Ok(result.last_insert_rowid())
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(result.last_insert_rowid()))
 }
 
 /// Metadata fields that can be edited after a document is uploaded.
@@ -283,6 +294,102 @@ pub async fn document_exists_by_sha256(
     Ok(count > 0)
 }
 
+/// Rows returned per page by the paginated listings.
+pub const PAGE_SIZE: i64 = 100;
+
+/// A single page of documents plus the counts needed to render a pager.
+#[derive(Debug)]
+pub struct DocumentPage {
+    pub documents: Vec<Document>,
+    /// 1-based index of the page that was returned.
+    pub page: i64,
+    pub per_page: i64,
+    /// Total number of documents matching the listing.
+    pub total: i64,
+    /// Row offset the query used. Always non-negative.
+    pub offset: i64,
+}
+
+impl DocumentPage {
+    /// Total number of pages, never less than 1 so the UI always has a page to show.
+    ///
+    /// `per_page` is a public field, so guard against zero rather than relying
+    /// on the clamp inside [`get_documents_page`].
+    pub fn total_pages(&self) -> i64 {
+        if self.per_page <= 0 {
+            return 1;
+        }
+        // `div_ceil` is still unstable for `i64`, so round up by hand.
+        let raw = self.total / self.per_page;
+        let has_remainder = self.total % self.per_page != 0;
+        (raw + i64::from(has_remainder)).max(1)
+    }
+
+    /// True when this page is not the first one.
+    pub fn has_previous(&self) -> bool {
+        self.page > 1
+    }
+
+    /// True when at least one more document exists after this page.
+    pub fn has_next(&self) -> bool {
+        self.page < self.total_pages()
+    }
+}
+
+/// Total number of documents, used to compute the pager bounds.
+pub async fn count_documents(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+        .fetch_one(pool)
+        .await
+}
+
+/// Returns one page of documents ordered newest-first.
+///
+/// `page` is 1-based and is clamped to a valid range, so an out-of-bounds or
+/// hostile value yields the nearest page rather than an error.
+pub async fn get_documents_page(
+    pool: &SqlitePool,
+    page: i64,
+    per_page: i64,
+) -> Result<DocumentPage, sqlx::Error> {
+    let per_page = per_page.clamp(1, 1000);
+    let total = count_documents(pool).await?;
+
+    // An empty listing still reports one (empty) page rather than zero.
+    let total_pages = {
+        let raw = total / per_page;
+        let has_remainder = total % per_page != 0;
+        (raw + i64::from(has_remainder)).max(1)
+    };
+    // `clamp` keeps `page` within 1..=total_pages, so the subtraction below
+    // cannot underflow even for i64::MIN.
+    let page = page.clamp(1, total_pages);
+    let offset = (page - 1) * per_page;
+
+    let documents = sqlx::query_as::<_, Document>(
+        r#"
+        SELECT id, title, part_number, manufacturer, document_id, document_version,
+               package_marking, device_address, notes, storage_date,
+               original_file_name, file_sha256, file_path
+        FROM documents
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(per_page)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(DocumentPage {
+        documents,
+        page,
+        per_page,
+        total,
+        offset,
+    })
+}
+
 pub async fn get_all_documents(pool: &SqlitePool) -> Result<Vec<Document>, sqlx::Error> {
     let documents = sqlx::query_as::<_, Document>(
         r#"
@@ -363,7 +470,7 @@ pub struct DocumentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     pub struct TestDb {
         pub pool: SqlitePool,
@@ -414,9 +521,10 @@ mod tests {
             file_path: "/tmp/test/abcd1234567890/test.pdf".to_string(),
         };
 
-        let id = insert_or_update_document(&test_db.pool, new_doc)
+        let id = insert_document_if_absent(&test_db.pool, new_doc)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("document should be inserted");
         assert!(id > 0);
 
         // Test search
@@ -445,9 +553,10 @@ mod tests {
             file_path: "/tmp/test/unique_sha256_hash/sha_test.pdf".to_string(),
         };
 
-        insert_or_update_document(&test_db.pool, new_doc)
+        insert_document_if_absent(&test_db.pool, new_doc)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("document should be inserted");
 
         let result = get_document_by_sha256(&test_db.pool, "unique_sha256_hash")
             .await
@@ -456,6 +565,110 @@ mod tests {
         let doc = result.unwrap();
         assert_eq!(doc.title, "SHA Test Document");
         assert_eq!(doc.file_sha256, "unique_sha256_hash");
+    }
+
+    #[tokio::test]
+    async fn test_insert_document_if_absent_rejects_duplicate() {
+        let test_db = setup_test_db().await;
+
+        let first = NewDocument {
+            title: "Original Title".to_string(),
+            part_number: Some("PN-ORIGINAL".to_string()),
+            manufacturer: Some("Original Corp".to_string()),
+            document_id: None,
+            document_version: None,
+            package_marking: None,
+            device_address: None,
+            notes: Some("original notes".to_string()),
+            storage_date: "2024-01-01".to_string(),
+            original_file_name: "original.pdf".to_string(),
+            file_sha256: "duplicate_hash".to_string(),
+            file_path: "/tmp/test/duplicate_hash/original.pdf".to_string(),
+        };
+
+        let first_id = insert_document_if_absent(&test_db.pool, first)
+            .await
+            .unwrap()
+            .expect("first insert should succeed");
+
+        // Same content, different metadata and filename.
+        let second = NewDocument {
+            title: "Replacement Title".to_string(),
+            part_number: Some("PN-REPLACEMENT".to_string()),
+            manufacturer: Some("Replacement Corp".to_string()),
+            document_id: None,
+            document_version: None,
+            package_marking: None,
+            device_address: None,
+            notes: Some("replacement notes".to_string()),
+            storage_date: "2025-12-31".to_string(),
+            original_file_name: "replacement.pdf".to_string(),
+            file_sha256: "duplicate_hash".to_string(),
+            file_path: "/tmp/test/duplicate_hash/replacement.pdf".to_string(),
+        };
+
+        // Rejected rather than replacing the existing row.
+        let result = insert_document_if_absent(&test_db.pool, second)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "duplicate content must be rejected");
+
+        // The original row is untouched: no metadata, id, or path was replaced.
+        let stored = get_document_by_sha256(&test_db.pool, "duplicate_hash")
+            .await
+            .unwrap()
+            .expect("original document must still exist");
+
+        assert_eq!(stored.id, first_id);
+        assert_eq!(stored.title, "Original Title");
+        assert_eq!(stored.part_number, Some("PN-ORIGINAL".to_string()));
+        assert_eq!(stored.manufacturer, Some("Original Corp".to_string()));
+        assert_eq!(stored.notes, Some("original notes".to_string()));
+        assert_eq!(stored.original_file_name, "original.pdf");
+        assert_eq!(stored.file_path, "/tmp/test/duplicate_hash/original.pdf");
+        assert_eq!(stored.storage_date, "2024-01-01");
+
+        // Exactly one row exists for that hash.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE file_sha256 = ?")
+            .bind("duplicate_hash")
+            .fetch_one(&test_db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_insert_document_if_absent_allows_distinct_content() {
+        let test_db = setup_test_db().await;
+
+        // Different content means a different hash, so both must be accepted
+        // even when the metadata is otherwise identical.
+        for hash in ["hash_one", "hash_two", "hash_three"] {
+            let inserted = insert_document_if_absent(
+                &test_db.pool,
+                NewDocument {
+                    title: "Same Title".to_string(),
+                    part_number: Some("PN-SAME".to_string()),
+                    manufacturer: None,
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: "same.pdf".to_string(),
+                    file_sha256: hash.to_string(),
+                    file_path: format!("/tmp/test/{}/same.pdf", hash),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                inserted.is_some(),
+                "distinct content ({hash}) must be accepted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -483,13 +696,16 @@ mod tests {
                 .unwrap()
         );
 
-        insert_or_update_document(&test_db.pool, new_doc)
+        insert_document_if_absent(&test_db.pool, new_doc)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("document should be inserted");
 
-        assert!(document_exists_by_sha256(&test_db.pool, "exists_test_hash")
-            .await
-            .unwrap());
+        assert!(
+            document_exists_by_sha256(&test_db.pool, "exists_test_hash")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -527,12 +743,14 @@ mod tests {
             file_path: "/tmp/test/hash2/doc2.pdf".to_string(),
         };
 
-        insert_or_update_document(&test_db.pool, doc1)
+        insert_document_if_absent(&test_db.pool, doc1)
             .await
-            .unwrap();
-        insert_or_update_document(&test_db.pool, doc2)
+            .unwrap()
+            .expect("document should be inserted");
+        insert_document_if_absent(&test_db.pool, doc2)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("document should be inserted");
 
         let stats = get_document_stats(&test_db.pool).await.unwrap();
         assert_eq!(stats.total_documents, 2);
@@ -540,7 +758,271 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_latest_documents() {
+    async fn test_document_page_pagination() {
+        let test_db = setup_test_db().await;
+
+        // Seed 25 documents with distinct titles.
+        for i in 0..25 {
+            insert_document_if_absent(
+                &test_db.pool,
+                NewDocument {
+                    title: format!("Doc {:02}", i),
+                    part_number: Some(format!("PN{:02}", i)),
+                    manufacturer: Some("Test Corp".to_string()),
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: format!("doc{}.pdf", i),
+                    file_sha256: format!("hash_{:02}", i),
+                    file_path: format!("/tmp/test/{}/doc.pdf", i),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Page 1 of 10 should hold the 10 newest, newest-first.
+        let first = get_documents_page(&test_db.pool, 1, 10).await.unwrap();
+        assert_eq!(first.page, 1);
+        assert_eq!(first.per_page, 10);
+        assert_eq!(first.total, 25);
+        assert_eq!(first.total_pages(), 3);
+        assert_eq!(first.documents.len(), 10);
+        assert_eq!(first.documents[0].title, "Doc 24");
+        assert_eq!(first.documents[9].title, "Doc 15");
+        assert!(!first.has_previous());
+        assert!(first.has_next());
+
+        // Middle page.
+        let second = get_documents_page(&test_db.pool, 2, 10).await.unwrap();
+        assert_eq!(second.documents.len(), 10);
+        assert_eq!(second.documents[0].title, "Doc 14");
+        assert!(second.has_previous());
+        assert!(second.has_next());
+
+        // Final, partial page.
+        let third = get_documents_page(&test_db.pool, 3, 10).await.unwrap();
+        assert_eq!(third.documents.len(), 5);
+        assert_eq!(third.documents[0].title, "Doc 04");
+        assert!(third.has_previous());
+        assert!(!third.has_next());
+
+        // Pages must not overlap and together must cover every document.
+        let mut seen: Vec<String> = Vec::new();
+        for page in 1..=3 {
+            let p = get_documents_page(&test_db.pool, page, 10).await.unwrap();
+            seen.extend(p.documents.into_iter().map(|d| d.title));
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 25);
+    }
+
+    #[tokio::test]
+    async fn test_document_page_clamps_out_of_range_values() {
+        let test_db = setup_test_db().await;
+
+        for i in 0..3 {
+            insert_document_if_absent(
+                &test_db.pool,
+                NewDocument {
+                    title: format!("Doc {}", i),
+                    part_number: None,
+                    manufacturer: None,
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: format!("doc{}.pdf", i),
+                    file_sha256: format!("hash_{}", i),
+                    file_path: "/tmp/test/doc.pdf".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("document should be inserted");
+        }
+
+        // A page far past the end clamps to the last page rather than erroring.
+        let beyond = get_documents_page(&test_db.pool, 9_999, 10).await.unwrap();
+        assert_eq!(beyond.page, 1, "only one page exists, so it clamps to 1");
+        assert_eq!(beyond.documents.len(), 3);
+
+        // Non-positive page and page size are clamped rather than rejected.
+        let zero_page = get_documents_page(&test_db.pool, 0, 10).await.unwrap();
+        assert_eq!(zero_page.page, 1);
+
+        let clamped_size = get_documents_page(&test_db.pool, 1, 0).await.unwrap();
+        assert_eq!(
+            clamped_size.per_page, 1,
+            "page size is clamped to at least 1"
+        );
+        assert_eq!(clamped_size.documents.len(), 1);
+
+        let huge = get_documents_page(&test_db.pool, 1, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(huge.per_page, 1000, "page size is capped to a sane maximum");
+    }
+
+    #[tokio::test]
+    async fn test_document_page_empty_database() {
+        let test_db = setup_test_db().await;
+
+        let page = get_documents_page(&test_db.pool, 1, 100).await.unwrap();
+
+        assert!(page.documents.is_empty());
+        assert_eq!(page.total, 0);
+        // Always at least one page so the UI has something to render.
+        assert_eq!(page.total_pages(), 1);
+        assert!(!page.has_previous());
+        assert!(!page.has_next());
+    }
+
+    #[tokio::test]
+    async fn test_default_page_size_is_100() {
+        assert_eq!(PAGE_SIZE, 100);
+    }
+
+    #[tokio::test]
+    async fn test_count_documents() {
+        let test_db = setup_test_db().await;
+
+        assert_eq!(count_documents(&test_db.pool).await.unwrap(), 0);
+
+        for i in 0..3 {
+            insert_document_if_absent(
+                &test_db.pool,
+                NewDocument {
+                    title: format!("Doc {}", i),
+                    part_number: None,
+                    manufacturer: None,
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: "doc.pdf".to_string(),
+                    file_sha256: format!("hash_{}", i),
+                    file_path: "/tmp/test/doc.pdf".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("document should be inserted");
+        }
+
+        assert_eq!(count_documents(&test_db.pool).await.unwrap(), 3);
+    }
+
+    #[test]
+    fn test_document_page_total_pages_guards_against_zero_per_page() {
+        // `per_page` is a public field, so `total_pages` must not divide by zero
+        // even though `get_documents_page` always clamps it to at least 1.
+        let page = DocumentPage {
+            documents: Vec::new(),
+            page: 1,
+            per_page: 0,
+            total: 42,
+            offset: 0,
+        };
+        assert_eq!(page.total_pages(), 1);
+
+        let negative = DocumentPage {
+            documents: Vec::new(),
+            page: 1,
+            per_page: -10,
+            total: 42,
+            offset: 0,
+        };
+        assert_eq!(negative.total_pages(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_document_page_clamps_extreme_page_values() {
+        let test_db = setup_test_db().await;
+
+        for i in 0..3 {
+            insert_document_if_absent(
+                &test_db.pool,
+                NewDocument {
+                    title: format!("Doc {}", i),
+                    part_number: None,
+                    manufacturer: None,
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: "doc.pdf".to_string(),
+                    file_sha256: format!("hash_{}", i),
+                    file_path: "/tmp/test/doc.pdf".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("document should be inserted");
+        }
+
+        // `i64::MIN` would underflow `page - 1` without the clamp; with only
+        // 3 documents there is a single page, so both extremes land on 1.
+        for hostile in [i64::MIN, i64::MIN + 1, -1, 0, i64::MAX] {
+            let page = get_documents_page(&test_db.pool, hostile, 10)
+                .await
+                .unwrap_or_else(|e| panic!("page={hostile} should not error: {e}"));
+
+            assert_eq!(page.page, 1, "page={hostile} must clamp to 1");
+            assert_eq!(page.documents.len(), 3);
+            // A clamped page of 1 yields offset 0, so the full set comes back
+            // rather than an empty tail from a huge negative offset.
+            assert!(page.offset >= 0);
+        }
+
+        // On a multi-page listing the extremes clamp to the two ends.
+        for i in 3..25 {
+            insert_document_if_absent(
+                &test_db.pool,
+                NewDocument {
+                    title: format!("Doc {}", i),
+                    part_number: None,
+                    manufacturer: None,
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: "doc.pdf".to_string(),
+                    file_sha256: format!("hash_{}", i),
+                    file_path: "/tmp/test/doc.pdf".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("document should be inserted");
+        }
+
+        // 25 docs at 10 per page => 3 pages.
+        let first = get_documents_page(&test_db.pool, i64::MIN, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.page, 1, "i64::MIN must clamp to the first page");
+
+        let last = get_documents_page(&test_db.pool, i64::MAX, 10)
+            .await
+            .unwrap();
+        assert_eq!(last.page, 3, "i64::MAX must clamp to the last page");
+    }
+
+    #[tokio::test]
+    async fn test_get_all_documents() {
         let test_db = setup_test_db().await;
 
         // Insert test documents with different timestamps
@@ -590,15 +1072,18 @@ mod tests {
         };
 
         // Insert documents in order
-        insert_or_update_document(&test_db.pool, doc1)
+        insert_document_if_absent(&test_db.pool, doc1)
             .await
-            .unwrap();
-        insert_or_update_document(&test_db.pool, doc2)
+            .unwrap()
+            .expect("document should be inserted");
+        insert_document_if_absent(&test_db.pool, doc2)
             .await
-            .unwrap();
-        insert_or_update_document(&test_db.pool, doc3)
+            .unwrap()
+            .expect("document should be inserted");
+        insert_document_if_absent(&test_db.pool, doc3)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("document should be inserted");
 
         // Get latest 2 documents
         let latest = get_latest_documents(&test_db.pool, 2).await.unwrap();
@@ -640,9 +1125,10 @@ mod tests {
             file_path: "/tmp/test/update_test_hash.pdf".to_string(),
         };
 
-        insert_or_update_document(&test_db.pool, new_doc)
+        insert_document_if_absent(&test_db.pool, new_doc)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("document should be inserted");
 
         // Update the document metadata
         update_document_metadata(

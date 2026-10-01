@@ -1,9 +1,9 @@
 use axum::{
+    Router,
     extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post, put},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,13 +16,13 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::{
+    AppState,
     auth::{
-        create_jwt_token_with_secret, extract_token_from_headers, get_client_ip, is_ip_whitelisted,
-        validate_auth_key, verify_jwt_token_with_secret, AuthRequest, AuthResponse,
+        AuthRequest, AuthResponse, create_jwt_token_with_secret, extract_token_from_headers,
+        get_client_ip, is_ip_whitelisted, validate_auth_key, verify_jwt_token_with_secret,
     },
     database::{self, NewDocument},
     shared::AuthStatusResponse,
-    AppState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +141,7 @@ pub fn create_api_routes() -> Router<AppState> {
         .route("/auth", post(handle_auth))
         .route("/auth/status", get(handle_auth_status))
         .route("/search", get(handle_search))
+        .route("/documents", get(handle_list))
         .route("/submit", post(handle_submit))
         .route("/document/{sha256}", get(handle_get_document))
         .route("/document/{sha256}", put(handle_update_document))
@@ -171,7 +172,9 @@ pub async fn handle_auth(
             info!("IP {} is whitelisted", ip);
         }
         None => {
-            warn!("Could not determine client IP for authentication (checked headers and connection info)");
+            warn!(
+                "Could not determine client IP for authentication (checked headers and connection info)"
+            );
             return Ok(Json(AuthResponse {
                 success: false,
                 message: "Could not verify IP address".to_string(),
@@ -273,6 +276,79 @@ pub async fn handle_search(
         }
         Err(e) => {
             error!("Database search error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Query parameters for the paginated document listing.
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub page: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListResponse {
+    pub results: Vec<SearchResult>,
+    pub page: i64,
+    pub per_page: i64,
+    pub total: i64,
+    pub total_pages: i64,
+    pub has_previous: bool,
+    pub has_next: bool,
+    duration_ms: u128,
+}
+
+pub async fn handle_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<ListResponse>, StatusCode> {
+    let start_time = Instant::now();
+
+    // An absent or nonsensical `page` starts at the first page; out-of-range
+    // pages are clamped inside `get_documents_page`.
+    let page = match query.page {
+        Some(requested) if requested > 0 => requested,
+        _ => 1,
+    };
+
+    match database::get_documents_page(&state.database, page, database::PAGE_SIZE).await {
+        Ok(page_data) => {
+            let duration = start_time.elapsed().as_millis();
+            let total_pages = page_data.total_pages();
+            // Read the metadata before `documents` is consumed by `into_iter`.
+            let (page_number, per_page, total, has_previous, has_next) = (
+                page_data.page,
+                page_data.per_page,
+                page_data.total,
+                page_data.has_previous(),
+                page_data.has_next(),
+            );
+            let result_count = page_data.documents.len();
+
+            info!(
+                "Listed page {} of {} ({} documents) in {}ms",
+                page_number, total_pages, result_count, duration
+            );
+
+            Ok(Json(ListResponse {
+                results: page_data
+                    .documents
+                    .into_iter()
+                    .map(SearchResult::from)
+                    .collect(),
+                page: page_number,
+                per_page,
+                total,
+                total_pages,
+                has_previous,
+                has_next,
+                duration_ms: duration,
+            }))
+        }
+        Err(e) => {
+            error!("Database error listing documents: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -385,6 +461,24 @@ pub async fn handle_submit(
         original_filename, file_hash
     );
 
+    // Reject an identical file before writing anything to disk, so a duplicate
+    // cannot overwrite the stored copy or leave orphaned bytes behind.
+    match database::document_exists_by_sha256(&state.database, &file_hash).await {
+        Ok(true) => {
+            warn!("Rejected duplicate upload: {}", file_hash);
+            return Ok(Json(SubmitResponse {
+                success: false,
+                message: "This file has already been uploaded.".to_string(),
+                file_sha256: Some(file_hash),
+            }));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            error!("Failed to check for an existing document: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
     // Create file storage directory
     let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
 
@@ -429,12 +523,23 @@ pub async fn handle_submit(
         file_path: file_path.to_string_lossy().to_string(),
     };
 
-    match database::insert_or_update_document(&state.database, new_document).await {
-        Ok(id) => {
+    match database::insert_document_if_absent(&state.database, new_document).await {
+        Ok(Some(id)) => {
             info!("Document {} stored successfully with ID: {}", title, id);
             Ok(Json(SubmitResponse {
                 success: true,
                 message: "Document uploaded successfully".to_string(),
+                file_sha256: Some(file_hash),
+            }))
+        }
+        // Lost a race against a concurrent upload of the same file. Drop the
+        // bytes we just wrote so the stored copy is not duplicated on disk.
+        Ok(None) => {
+            warn!("Duplicate upload rejected during insert: {}", file_hash);
+            let _ = tokio::fs::remove_file(&file_path).await;
+            Ok(Json(SubmitResponse {
+                success: false,
+                message: "This file has already been uploaded.".to_string(),
                 file_sha256: Some(file_hash),
             }))
         }

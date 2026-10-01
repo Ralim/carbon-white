@@ -102,11 +102,9 @@ pub fn LoginPage() -> impl IntoView {
                         if response.success {
                             // Store the token in localStorage
                             if let Some(token) = response.token {
-                                if let Some(window) = web_sys::window() {
-                                    if let Some(storage) = window.local_storage().unwrap_or(None) {
-                                        let _ = storage.set_item("carbon_auth_token", &token);
-                                    }
-                                }
+                                let _ = web_sys::window()
+                                    .and_then(|window| window.local_storage().ok().flatten())
+                                    .map(|storage| storage.set_item("carbon_auth_token", &token));
                             }
                             set_success_message
                                 .set(Some("Login successful! Redirecting...".to_string()));

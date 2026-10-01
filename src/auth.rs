@@ -1,12 +1,12 @@
-use crate::ip_subnet::IPSubnet;
 use crate::AppState;
+use crate::ip_subnet::IPSubnet;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use tracing::{error, info, warn};
@@ -61,29 +61,24 @@ pub fn verify_jwt_token_with_secret(
 
 pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
     // Try to get token from Authorization header
-    if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Bearer ") {
-                return Some(auth_str.trim_start_matches("Bearer ").to_string());
-            }
-        }
+    if let Some(token) = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Some(token.to_string());
     }
 
     // Try to get token from cookie
-    if let Some(cookie_header) = headers.get("cookie") {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for cookie in cookie_str.split(';') {
-                let cookie = cookie.trim();
-                if let Some((name, value)) = cookie.split_once('=') {
-                    if name.trim() == "carbon_auth_token" {
-                        return Some(value.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name.trim() == "carbon_auth_token").then(|| value.trim().to_string())
+            })
+        })
 }
 
 pub async fn auth_middleware(
@@ -177,28 +172,22 @@ pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IPSubnet]) -> bool {
 }
 
 pub fn get_client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
-    // Try X-Forwarded-For header first (for reverse proxies)
-    if let Some(xff_header) = headers.get("x-forwarded-for") {
-        if let Ok(xff_str) = xff_header.to_str() {
-            // Take the first IP in the comma-separated list
-            if let Some(first_ip) = xff_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
-        }
+    // Try X-Forwarded-For header first (for reverse proxies), taking the first
+    // IP in the comma-separated list.
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|forwarded| forwarded.split(',').next())
+        .and_then(|first| first.trim().parse::<IpAddr>().ok())
+    {
+        return Some(ip);
     }
 
     // Try X-Real-IP header
-    if let Some(xri_header) = headers.get("x-real-ip") {
-        if let Ok(xri_str) = xri_header.to_str() {
-            if let Ok(ip) = xri_str.parse::<IpAddr>() {
-                return Some(ip);
-            }
-        }
-    }
-
-    None
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|real_ip| real_ip.parse::<IpAddr>().ok())
 }
 
 /// Get client IP address from headers with fallback to connection info
@@ -227,7 +216,7 @@ pub fn get_client_ip(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> O
 #[cfg(test)]
 mod test_auth {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::str::FromStr;
 
     #[test]

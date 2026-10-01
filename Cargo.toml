@@ -1,7 +1,7 @@
 [package]
 name = "carbon-white"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -141,3 +141,11 @@ lib-default-features = false
 #
 # Optional. Defaults to "release".
 lib-profile-release = "wasm-release"
+
+
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2

@@ -1,15 +1,16 @@
 #![recursion_limit = "1024"]
 
+#[cfg(feature = "ssr")]
 use carbon_white::ip_subnet::IPSubnet;
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
     #[allow(unused_imports)] // Required for into_make_service_with_connect_info trait method
     use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
-    use axum::{extract::DefaultBodyLimit, Router};
+    use axum::{Router, extract::DefaultBodyLimit};
     use carbon_white::*;
     use leptos::prelude::*;
-    use leptos_axum::{generate_route_list, LeptosRoutes};
+    use leptos_axum::{LeptosRoutes, generate_route_list};
     use std::env;
     use std::net::SocketAddr;
     use tower_http::services::ServeDir;
@@ -116,12 +117,28 @@ pub fn main() {
 async fn serve_favicon(
     request: axum::extract::Request,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    use leptos::prelude::*;
+
+    // Resolve the site root from the build-time configuration and delegate.
+    let site_root = get_configuration(None).unwrap().leptos_options.site_root;
+    serve_favicon_at(request, site_root.as_ref()).await
+}
+
+/// Serves a static asset from `site_root`.
+///
+/// Split out from [`serve_favicon`] so tests can point at a temporary directory
+/// directly instead of mutating process-global environment state, which is both
+/// unsafe under edition 2024 and racy across concurrently running tests.
+#[cfg(feature = "ssr")]
+async fn serve_favicon_at(
+    request: axum::extract::Request,
+    site_root: &str,
+) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
     use axum::{
         body::Body,
-        http::{header, StatusCode},
+        http::{StatusCode, header},
         response::Response,
     };
-    use leptos::prelude::*;
     use std::path::Path;
     use tokio::fs;
 
@@ -129,14 +146,11 @@ async fn serve_favicon(
     let path = request.uri().path();
     let filename = path.trim_start_matches('/');
 
-    // Get site root from leptos options
-    let conf = get_configuration(None).unwrap();
-    let site_root = conf.leptos_options.site_root;
-    let file_path = Path::new(site_root.as_ref()).join(filename);
+    let file_path = Path::new(site_root).join(filename);
 
     match fs::read(&file_path).await {
         Ok(content) => {
-            let mime_type = match filename.split('.').next_back() {
+            let mime_type = match filename.rsplit('.').next() {
                 Some("ico") => "image/x-icon",
                 Some("png") => "image/png",
                 Some("webmanifest") => "application/manifest+json",
@@ -156,6 +170,11 @@ async fn serve_favicon(
     }
 }
 
+/// Parses a comma-separated whitelist of IPs or CIDR ranges.
+///
+/// Only the SSR binary uses this, so it is gated out of a client-only build
+/// where it would otherwise be reported as dead code.
+#[cfg(feature = "ssr")]
 fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
     if whitelist.is_empty() {
         return Vec::new();
@@ -171,10 +190,11 @@ fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
 #[cfg(feature = "ssr")]
 mod tests {
     use super::*;
-    use carbon_white::{api, database, file_server, App, AppState};
+    use carbon_white::{App, AppState, api, database, file_server};
     use leptos::prelude::get_configuration;
     use leptos_axum::generate_route_list;
     use std::net::SocketAddr;
+    use tempfile::TempDir;
 
     #[test]
     fn test_parse_ip_whitelist_empty() {
@@ -476,6 +496,303 @@ mod tests {
         assert!(result["token"].is_null());
     }
 
+    /// Builds a router over a temp database seeded with `count` documents.
+    ///
+    /// The returned `TempDir` must be kept alive for as long as the pool is
+    /// used, since it owns the SQLite file on disk.
+    async fn seeded_router(count: usize) -> (axum::Router, TempDir) {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        // `init_db` appends `carbon.db` itself, so point it at the directory.
+        let db_dir = temp_dir.path().to_string_lossy().to_string();
+
+        let pool = database::init_db(&db_dir).await.expect("Failed to init db");
+
+        for i in 0..count {
+            database::insert_document_if_absent(
+                &pool,
+                database::NewDocument {
+                    title: format!("Doc {:03}", i),
+                    part_number: Some(format!("PN{:03}", i)),
+                    manufacturer: Some("Test Corp".to_string()),
+                    document_id: None,
+                    document_version: None,
+                    package_marking: None,
+                    device_address: None,
+                    notes: None,
+                    storage_date: "2024-01-01".to_string(),
+                    original_file_name: format!("doc{}.pdf", i),
+                    file_sha256: format!("{:064x}", i),
+                    file_path: format!("{}/doc.pdf", db_dir),
+                },
+            )
+            .await
+            .expect("Failed to seed document")
+            .expect("document should be inserted");
+        }
+
+        let state = AppState {
+            database: pool,
+            data_dir: db_dir,
+            auth_key: "test_auth_key".to_string(),
+            whitelist_ips: vec![],
+        };
+
+        (api::create_api_routes().with_state(state), temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_submit_rejects_duplicate_file() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let auth_key = "duplicate_test_key";
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        let db_dir = temp_dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(format!("{}/files", db_dir)).unwrap();
+
+        let pool = database::init_db(&db_dir).await.expect("Failed to init db");
+        let state = AppState {
+            database: pool,
+            data_dir: db_dir.clone(),
+            auth_key: auth_key.to_string(),
+            whitelist_ips: vec![],
+        };
+        let router = api::create_api_routes().with_state(state);
+
+        let token = create_jwt_token_with_secret(auth_key.as_bytes()).unwrap();
+        let boundary = "----cwtestboundary";
+        let content = b"identical file contents";
+
+        // Builds a multipart/form-data body with a single file part.
+        let build_body = |filename: &str, title: &str| {
+            let mut body = Vec::new();
+            body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+            body.extend_from_slice(b"Content-Disposition: form-data; name=\"title\"\r\n\r\n");
+            body.extend_from_slice(title.as_bytes());
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+                    filename
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend_from_slice(content);
+            body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+            body
+        };
+
+        let send = |filename: &str, title: &str| {
+            let body = build_body(filename, title);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/submit")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={}", boundary),
+                )
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::from(body))
+                .unwrap();
+            let router = router.clone();
+            async move { router.oneshot(request).await.unwrap() }
+        };
+
+        // First upload of the content is accepted.
+        let first = send("first.pdf", "First Title").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["success"], true);
+
+        // Uploading the same bytes again is rejected, even with a different
+        // name and title.
+        let second = send("second.pdf", "Second Title").await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+
+        assert_eq!(second_json["success"], false);
+        assert!(
+            second_json["message"]
+                .as_str()
+                .unwrap()
+                .contains("already been uploaded"),
+            "unexpected message: {second_json}"
+        );
+
+        // The original record must be intact, not replaced by the second upload.
+        let stored = database::get_document_by_sha256(
+            &database::init_db(&db_dir).await.unwrap(),
+            first_json["file_sha256"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("original document should still exist");
+        assert_eq!(stored.title, "First Title");
+        assert_eq!(stored.original_file_name, "first.pdf");
+
+        // The rejected upload must not have written a second copy to disk.
+        let hash = first_json["file_sha256"].as_str().unwrap();
+        let dir = std::path::Path::new(&db_dir).join("files").join(hash);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["first.pdf".to_string()],
+            "only the accepted upload should be on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_endpoint_pagination() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        // 250 documents at the default page size of 100 gives 3 pages.
+        let (router, _temp) = seeded_router(250).await;
+
+        async fn get_page(router: axum::Router, uri: &str) -> serde_json::Value {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        // First page: full, and links forward only.
+        let first = get_page(router.clone(), "/documents").await;
+        assert_eq!(first["page"], 1);
+        assert_eq!(first["per_page"], 100);
+        assert_eq!(first["total"], 250);
+        assert_eq!(first["total_pages"], 3);
+        assert_eq!(first["results"].as_array().unwrap().len(), 100);
+        assert_eq!(first["has_previous"], false);
+        assert_eq!(first["has_next"], true);
+
+        // Middle page.
+        let second = get_page(router.clone(), "/documents?page=2").await;
+        assert_eq!(second["page"], 2);
+        assert_eq!(second["results"].as_array().unwrap().len(), 100);
+        assert_eq!(second["has_previous"], true);
+        assert_eq!(second["has_next"], true);
+
+        // Last page: partial, links backward only.
+        let third = get_page(router.clone(), "/documents?page=3").await;
+        assert_eq!(third["page"], 3);
+        assert_eq!(third["results"].as_array().unwrap().len(), 50);
+        assert_eq!(third["has_previous"], true);
+        assert_eq!(third["has_next"], false);
+
+        // Pages must not overlap.
+        let first_titles: Vec<String> = first["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["title"].as_str().unwrap().to_string())
+            .collect();
+        let third_titles: Vec<String> = third["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["title"].as_str().unwrap().to_string())
+            .collect();
+        for title in &first_titles {
+            assert!(
+                !third_titles.contains(title),
+                "page 1 and page 3 must not share documents"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_endpoint_clamps_bad_pagination_params() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let (router, _temp) = seeded_router(5).await;
+
+        async fn get_page(router: axum::Router, uri: &str) -> serde_json::Value {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        // A page past the end is clamped rather than erroring.
+        let beyond = get_page(router.clone(), "/documents?page=500").await;
+        assert_eq!(beyond["page"], 1);
+        assert_eq!(beyond["results"].as_array().unwrap().len(), 5);
+
+        // Zero and negative values fall back to the defaults.
+        let zero_page = get_page(router.clone(), "/documents?page=0").await;
+        assert_eq!(zero_page["page"], 1);
+
+        let negative = get_page(router.clone(), "/documents?page=-3").await;
+        assert_eq!(negative["page"], 1);
+
+        // The page size is fixed server-side, so a `per_page` parameter is
+        // ignored rather than honoured.
+        let with_per_page = get_page(router.clone(), "/documents?per_page=2").await;
+        assert_eq!(with_per_page["per_page"], 100);
+        assert_eq!(with_per_page["results"].as_array().unwrap().len(), 5);
+        assert_eq!(with_per_page["total_pages"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_endpoint_empty_database() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let (router, _temp) = seeded_router(0).await;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/documents")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(result["total"], 0);
+        // One (empty) page so the client never has to divide by zero.
+        assert_eq!(result["total_pages"], 1);
+        assert_eq!(result["has_next"], false);
+        assert_eq!(result["has_previous"], false);
+        assert_eq!(result["results"].as_array().unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn test_favicon_serving() {
         use axum::body::Body;
@@ -506,9 +823,6 @@ mod tests {
         )
         .unwrap();
 
-        // Mock leptos configuration for testing
-        std::env::set_var("LEPTOS_SITE_ROOT", &site_root);
-
         // Test serving favicon.ico
         let ico_request = Request::builder()
             .method(Method::GET)
@@ -516,17 +830,19 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(ico_request).await;
+        let result = serve_favicon_at(ico_request, &site_root).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("image/x-icon"));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("image/x-icon")
+        );
 
         // Test serving PNG favicon
         let png_request = Request::builder()
@@ -535,17 +851,19 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(png_request).await;
+        let result = serve_favicon_at(png_request, &site_root).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("image/png"));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("image/png")
+        );
 
         // Test serving webmanifest
         let manifest_request = Request::builder()
@@ -554,17 +872,19 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(manifest_request).await;
+        let result = serve_favicon_at(manifest_request, &site_root).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("application/manifest+json"));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("application/manifest+json")
+        );
 
         // Test 404 for non-existent file
         let not_found_request = Request::builder()
@@ -573,12 +893,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result = serve_favicon(not_found_request).await;
+        let result = serve_favicon_at(not_found_request, &site_root).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
-
-        // Clean up
-        std::env::remove_var("LEPTOS_SITE_ROOT");
     }
 
     #[test]

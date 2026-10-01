@@ -1,4 +1,16 @@
-# Continuous Integration workflow for building  to check build is ok
+# Continuous Integration for Carbon White.
+#
+# Gates, in order of increasing cost:
+#   1. formatting  - rustfmt
+#   2. lints       - clippy over three feature configurations
+#   3. unit tests  - default and `ssr` feature sets
+#   4. build       - `cargo leptos build` compiles wasm + SSR and emits the site
+#
+# Each feature set is linted separately on purpose. Code behind
+# `#[cfg(feature = ...)]` is never type-checked outside its own configuration, so
+# a single lint run leaves whole areas of the app unchecked: the `ssr` build
+# compiles out the browser code, the wasm build compiles out the server code, and
+# a default-feature build compiles out both.
 
 name: CI - Build Carbon White
 
@@ -50,11 +62,18 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      # Cheapest lint pass: no server or browser dependencies are compiled here,
+      # so it runs first and fails fastest. Catches dead code that only appears
+      # when neither `ssr` nor `hydrate` is enabled.
+      - name: Lint (host / default features)
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Lint (host / ssr)
         run: cargo clippy --all-targets --features ssr -- -D warnings
 
       - name: Lint (wasm / hydrate)
         run: cargo clippy --lib --features hydrate --target wasm32-unknown-unknown -- -D warnings
+
       - name: Test (default features)
         run: cargo test
 

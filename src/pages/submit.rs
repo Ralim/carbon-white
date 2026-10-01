@@ -188,6 +188,10 @@ pub fn SubmitPage() -> impl IntoView {
                                                     set_package_marking.set(String::new());
                                                     set_device_address.set(String::new());
                                                     set_notes.set(String::new());
+                                                    // The file input is uncontrolled, so it has to be
+                                                    // cleared imperatively. Browsers only permit
+                                                    // assigning an empty value to a file input.
+                                                    file_input.set_value("");
                                                 } else {
                                                     set_error_message.set(Some(response.message));
                                                 }
