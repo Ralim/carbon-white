@@ -36,7 +36,7 @@ The _intent_ is that this can be self hosted at home or a workplace easily, then
    - Package Marking
    - Device Address
    - Notes
-3. Select a file to upload (up to 200MB)
+3. Select a file to upload (up to 250 MiB)
 4. Click "Submit Document"
 
 ### Downloading Documents

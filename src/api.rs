@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State},
+    extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State, multipart::Field},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post, put},
@@ -10,9 +10,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Instant;
+use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -58,23 +59,11 @@ pub struct SubmitResponse {
     pub file_sha256: Option<String>,
 }
 
-/// Maximum accepted upload size, enforced after the multipart body is decoded.
-const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
-
 /// Upper bound on a stored filename. Leaves headroom under the common 255-byte
-/// filesystem limit once the hash directory prefix is added.
+/// filesystem limit
 const MAX_FILENAME_LEN: usize = 200;
 
 /// Reduces a client-supplied upload filename to a single safe path component.
-///
-/// The filename arrives from a multipart `Content-Disposition` header and is
-/// therefore fully attacker controlled. Stripping every directory component
-/// prevents `../` traversal and absolute-path escapes, replacing characters that
-/// are unsafe on common filesystems keeps the name portable, and the fallback
-/// guarantees the result is never empty or a relative-directory marker.
-///
-/// The original name is still recorded in the database for display purposes; only
-/// the on-disk path is derived from this value.
 fn sanitize_upload_filename(raw: &str) -> String {
     // `rsplit` on both separators so that Windows-style paths are handled too.
     let basename = raw.rsplit(['/', '\\']).next().unwrap_or_default().trim();
@@ -354,6 +343,110 @@ pub async fn handle_list(
     }
 }
 
+/// A streamed upload that has been written and hashed but not yet committed to
+/// its final path.
+///
+/// The bytes land in a temporary file first because the destination path is
+/// derived from the content hash, which is not known until the upload has been
+/// read to the end.
+struct PendingUpload {
+    temp_path: PathBuf,
+    original_filename: String,
+    sha256: String,
+}
+
+/// Why streaming an upload part failed.
+enum UploadError {
+    /// The upload grew past the size limit and was abandoned mid-transfer.
+    TooLarge,
+    /// The multipart body was malformed.
+    Malformed(String),
+    /// The server failed while writing the file to disk.
+    Storage(String),
+}
+
+/// Directory holding uploads that are still in flight.
+fn incoming_dir(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join("files").join(".incoming")
+}
+
+/// Streams one multipart file part to a temporary file, hashing as it goes.
+async fn stream_file_to_temp(
+    field: &mut Field<'_>,
+    data_dir: &str,
+    filename: &str,
+) -> Result<PendingUpload, UploadError> {
+    let incoming = incoming_dir(data_dir);
+    tokio::fs::create_dir_all(&incoming).await.map_err(|e| {
+        UploadError::Storage(format!("failed to create upload staging directory: {e}"))
+    })?;
+
+    // The temporary name is random so simultaneous uploads cannot collide.
+    let temp_path = incoming.join(format!("{}.part", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+        UploadError::Storage(format!("failed to create {}: {e}", temp_path.display()))
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut total: usize = 0;
+
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        UploadError::Malformed(format!("error reading file data for '{filename}': {e}"))
+    })? {
+        total += chunk.len();
+        if total > crate::MAX_UPLOAD_SIZE {
+            // Stop reading immediately rather than draining the rest.
+            drop(file);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(UploadError::TooLarge);
+        }
+
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(|e| {
+            UploadError::Storage(format!("failed to write {}: {e}", temp_path.display()))
+        })?;
+    }
+
+    file.flush().await.map_err(|e| {
+        UploadError::Storage(format!("failed to flush {}: {e}", temp_path.display()))
+    })?;
+    // The handle must be closed before the file is moved into place, otherwise
+    // the rename races with the last write on some platforms.
+    drop(file);
+
+    info!("File data size: {} bytes", total);
+
+    Ok(PendingUpload {
+        temp_path,
+        original_filename: filename.to_string(),
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
+/// Removes uploads left behind by an interrupted or crashed request.
+///
+/// Anything still sitting in the staging directory has no database row, so it
+/// is unreachable and would otherwise occupy disk indefinitely.
+pub async fn purge_incomplete_uploads(data_dir: &str) {
+    let incoming = incoming_dir(data_dir);
+    let mut entries = match tokio::fs::read_dir(&incoming).await {
+        Ok(entries) => entries,
+        // Nothing staged yet, which is the normal case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!("Could not read upload staging directory: {}", e);
+            return;
+        }
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        match tokio::fs::remove_file(entry.path()).await {
+            Ok(()) => info!("Removed orphaned staged upload: {}", entry.path().display()),
+            Err(e) => warn!("Could not remove {}: {}", entry.path().display(), e),
+        }
+    }
+}
+
 pub async fn handle_submit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -384,10 +477,10 @@ pub async fn handle_submit(
     }
 
     let mut form_data: HashMap<String, String> = HashMap::new();
-    let mut file_data: Option<(String, Vec<u8>)> = None;
+    let mut uploaded: Option<PendingUpload> = None;
 
     // Process multipart form data with detailed error handling
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         error!("Error reading multipart field: {}", e);
         StatusCode::BAD_REQUEST
     })? {
@@ -401,26 +494,33 @@ pub async fn handle_submit(
                 filename, content_type
             );
 
-            // Read file data in chunks to handle large files better
-            let data = field.bytes().await.map_err(|e| {
-                error!("Error reading file data: {}", e);
-                error!("Filename: {}", filename);
-                StatusCode::BAD_REQUEST
-            })?;
-
-            if data.len() > MAX_FILE_SIZE {
-                return Ok(Json(SubmitResponse {
-                    success: false,
-                    message: format!(
-                        "File size exceeds {}MB limit",
-                        MAX_FILE_SIZE / (1024 * 1024)
-                    ),
-                    file_sha256: None,
-                }));
+            // A second file part would leave the first one's staged bytes
+            // unreachable, so discard them before overwriting the handle.
+            if let Some(previous) = uploaded.take() {
+                let _ = tokio::fs::remove_file(&previous.temp_path).await;
             }
 
-            info!("File data size: {} bytes", data.len());
-            file_data = Some((filename, data.to_vec()));
+            uploaded = match stream_file_to_temp(&mut field, &state.data_dir, &filename).await {
+                Ok(pending) => Some(pending),
+                Err(UploadError::TooLarge) => {
+                    return Ok(Json(SubmitResponse {
+                        success: false,
+                        message: format!(
+                            "File size exceeds {}MB limit",
+                            crate::MAX_UPLOAD_SIZE / (1024 * 1024)
+                        ),
+                        file_sha256: None,
+                    }));
+                }
+                Err(UploadError::Malformed(e)) => {
+                    error!("{}", e);
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                Err(UploadError::Storage(e)) => {
+                    error!("{}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
         } else {
             let value = field.text().await.map_err(|e| {
                 error!("Error reading form field {}: {}", name, e);
@@ -433,6 +533,9 @@ pub async fn handle_submit(
     // Validate required fields
     let title = form_data.get("title").cloned().unwrap_or_default();
     if title.trim().is_empty() {
+        if let Some(pending) = &uploaded {
+            let _ = tokio::fs::remove_file(&pending.temp_path).await;
+        }
         return Ok(Json(SubmitResponse {
             success: false,
             message: "Title is required".to_string(),
@@ -440,8 +543,8 @@ pub async fn handle_submit(
         }));
     }
 
-    let (original_filename, file_bytes) = match file_data {
-        Some(data) => data,
+    let pending = match uploaded {
+        Some(pending) => pending,
         None => {
             return Ok(Json(SubmitResponse {
                 success: false,
@@ -451,21 +554,21 @@ pub async fn handle_submit(
         }
     };
 
-    // Calculate file SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&file_bytes);
-    let file_hash = hex::encode(hasher.finalize());
+    let original_filename = pending.original_filename;
+    let file_hash = pending.sha256;
 
     info!(
         "Processing file upload: {} (SHA256: {})",
         original_filename, file_hash
     );
 
-    // Reject an identical file before writing anything to disk, so a duplicate
-    // cannot overwrite the stored copy or leave orphaned bytes behind.
+    // The bytes are already staged at this point, so a duplicate or a failed
+    // insert has to remove the staged copy. The final path is only chosen once
+    // the dedup check has passed.
     match database::document_exists_by_sha256(&state.database, &file_hash).await {
         Ok(true) => {
             warn!("Rejected duplicate upload: {}", file_hash);
+            let _ = tokio::fs::remove_file(&pending.temp_path).await;
             return Ok(Json(SubmitResponse {
                 success: false,
                 message: "This file has already been uploaded.".to_string(),
@@ -475,6 +578,7 @@ pub async fn handle_submit(
         Ok(false) => {}
         Err(e) => {
             error!("Failed to check for an existing document: {}", e);
+            let _ = tokio::fs::remove_file(&pending.temp_path).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
@@ -484,6 +588,7 @@ pub async fn handle_submit(
 
     if let Err(e) = std::fs::create_dir_all(&file_dir) {
         error!("Failed to create file directory: {}", e);
+        let _ = tokio::fs::remove_file(&pending.temp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -492,17 +597,16 @@ pub async fn handle_submit(
     // display only.
     let stored_filename = sanitize_upload_filename(&original_filename);
     let file_path = file_dir.join(&stored_filename);
-    let mut file = match tokio::fs::File::create(&file_path).await {
-        Ok(file) => file,
-        Err(e) => {
-            error!("Failed to create file: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
 
-    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &file_bytes).await {
-        error!("Failed to write file data: {}", e);
-        let _ = tokio::fs::remove_file(&file_path).await;
+    // Both paths live under the data directory, so the rename stays on one
+    // filesystem and the bytes are never copied a second time.
+    if let Err(e) = tokio::fs::rename(&pending.temp_path, &file_path).await {
+        error!(
+            "Failed to move upload into place at {}: {}",
+            file_path.display(),
+            e
+        );
+        let _ = tokio::fs::remove_file(&pending.temp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -813,6 +917,47 @@ mod tests {
         assert_eq!(response.duration_ms, 50);
     }
 
+    #[tokio::test]
+    async fn test_purge_incomplete_uploads_removes_orphans() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+
+        // Nothing staged yet: this is the normal startup path and must not
+        // error or fail.
+        purge_incomplete_uploads(data_dir).await;
+
+        let incoming = incoming_dir(data_dir);
+        std::fs::create_dir_all(&incoming).unwrap();
+        for name in ["a.part", "b.part", "c.part"] {
+            std::fs::write(incoming.join(name), b"orphaned bytes").unwrap();
+        }
+
+        purge_incomplete_uploads(data_dir).await;
+
+        let remaining: Vec<_> = std::fs::read_dir(&incoming)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "orphaned staged uploads should be cleared, found: {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_incomplete_uploads_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+
+        // Repeated calls, including before anything has ever been staged, must
+        // stay quiet rather than failing.
+        purge_incomplete_uploads(data_dir).await;
+        let incoming = incoming_dir(data_dir);
+        std::fs::create_dir_all(&incoming).unwrap();
+        purge_incomplete_uploads(data_dir).await;
+        purge_incomplete_uploads(data_dir).await;
+    }
+
     #[test]
     fn test_submit_response_creation() {
         let response = SubmitResponse {
@@ -882,8 +1027,9 @@ mod tests {
 
     #[test]
     fn test_file_size_limit_check() {
-        // Test that our file size limit constant is reasonable
-        const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB
+        // Reference the real constant rather than a local copy, so this test
+        // tracks the enforced limit instead of drifting away from it.
+        const MAX_FILE_SIZE: usize = crate::MAX_UPLOAD_SIZE;
 
         // Should accept reasonable file sizes
         let small_file_size = 1024; // 1KB
@@ -895,8 +1041,30 @@ mod tests {
         assert!(large_file_size <= MAX_FILE_SIZE);
 
         // Should reject oversized files
-        let oversized_file = 150 * 1024 * 1024; // 150MB
+        let oversized_file = 300 * 1024 * 1024; // 300MB
         assert!(oversized_file > MAX_FILE_SIZE);
+    }
+
+    #[test]
+    fn test_upload_limit_is_250_mib() {
+        // The documented limit. `README.md` states 250 MiB and this is the
+        // value the submit handler and body limit are both derived from.
+        assert_eq!(crate::MAX_UPLOAD_SIZE, 250 * 1024 * 1024);
+        assert_eq!(crate::MAX_UPLOAD_SIZE / (1024 * 1024), 250);
+    }
+
+    #[test]
+    fn test_body_limit_exceeds_file_limit() {
+        // The body limit must be strictly larger than the file limit, otherwise
+        // multipart framing pushes a maximum-sized file over the body limit and
+        // it is rejected before the handler ever reads it.
+        let body_limit = crate::MAX_UPLOAD_SIZE + crate::MULTIPART_OVERHEAD;
+        assert!(
+            body_limit > crate::MAX_UPLOAD_SIZE,
+            "body limit {body_limit} must exceed file limit {}",
+            crate::MAX_UPLOAD_SIZE
+        );
+        assert_eq!(crate::MULTIPART_OVERHEAD, 1024 * 1024);
     }
 
     #[test]

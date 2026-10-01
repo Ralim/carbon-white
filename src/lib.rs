@@ -16,6 +16,12 @@ pub mod ip_subnet;
 
 pub use app::*;
 
+/// Largest file the upload endpoint accepts, in bytes.
+pub const MAX_UPLOAD_SIZE: usize = 250 * 1024 * 1024;
+
+/// Headroom added on top of [`MAX_UPLOAD_SIZE`] for multipart framing.
+pub const MULTIPART_OVERHEAD: usize = 1024 * 1024;
+
 #[cfg(feature = "ssr")]
 #[derive(Clone)]
 pub struct AppState {

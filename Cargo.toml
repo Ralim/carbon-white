@@ -1,6 +1,6 @@
 [package]
 name = "carbon-white"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [lib]
@@ -28,6 +28,14 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tower-http = { version = "0.7", features = ["fs"], optional = true }
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"], optional = true }
+# Search uses SQLite's FTS5 module. sqlx links against the system SQLite by
+# default, and FTS5 is a compile-time option that some distributions build
+# without -- notably the `debian:trixie-slim` runtime image, which is not even
+# guaranteed to ship libsqlite3. Enabling `bundled` here compiles SQLite from
+# source with FTS5 always present, which also drops the undeclared dependency on
+# the build host having SQLite development headers. It is gated behind `ssr` so
+# the wasm build does not try to compile the C sources.
+libsqlite3-sys = { version = "0.37", optional = true, features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
@@ -58,6 +66,7 @@ ssr = [
     "dep:tower-http",
     "dep:leptos_axum",
     "dep:sqlx",
+    "dep:libsqlite3-sys",
     "dep:uuid",
     "dep:sha2",
     "dep:jsonwebtoken",
