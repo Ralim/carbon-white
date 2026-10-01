@@ -26,8 +26,7 @@ impl IPSubnet {
 }
 
 /// Formats a subnet as `ip/prefix`, omitting the prefix when it is a bare host
-/// (`/32` for IPv4, `/128` for IPv6) so that round-tripping a single address does
-/// not add redundant noise.
+/// (`/32` for IPv4, `/128` for IPv6)
 impl fmt::Display for IPSubnet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let max_mask = match self.ip_address {

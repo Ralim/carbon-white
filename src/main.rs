@@ -25,7 +25,7 @@ async fn main() {
         env::var("CARBON_DATA_DIR").unwrap_or_else(|_| "/tmp/carbon/".to_string());
     let carbon_auth_key = env::var("CARBON_AUTH_KEY").expect("CARBON_AUTH_KEY must be set");
     let carbon_whitelist_ips = env::var("CARBON_WHITELIST_IPS").unwrap_or_else(|_| {
-        warn!("CARBON_WHITELIST_IPS not set");
+        warn!("CARBON_WHITELIST_IPS not set, you only get localhost");
         "127.0.0.1,::1".to_string()
     });
 
@@ -36,6 +36,9 @@ async fn main() {
     std::fs::create_dir_all(&carbon_data_dir).expect("Failed to create data directory");
     std::fs::create_dir_all(format!("{}/files", carbon_data_dir))
         .expect("Failed to create files directory");
+
+    // Uploads staged that never finished have no database row, so they are unreachable. Clear them at startup.
+    api::purge_incomplete_uploads(&carbon_data_dir).await;
 
     // Initialize database
     let database = database::init_db(&carbon_data_dir)
@@ -64,7 +67,9 @@ async fn main() {
     let api_routes = Router::new()
         .nest("/api", api::create_api_routes())
         .nest("/file", file_server::create_file_routes())
-        .layer(DefaultBodyLimit::max(250 * 1024 * 1024)) // 250MB limit
+        .layer(DefaultBodyLimit::max(
+            carbon_white::MAX_UPLOAD_SIZE + carbon_white::MULTIPART_OVERHEAD,
+        ))
         .with_state(app_state);
 
     // Create static routes (must come before leptos routes to avoid fallback catching them)
@@ -109,7 +114,6 @@ async fn main() {
 #[cfg(not(feature = "ssr"))]
 pub fn main() {
     // no client-side main function
-    // unless we want this to work with e.g., Trunk for a purely client-side app
     // see lib.rs for hydration function instead
 }
 
@@ -125,10 +129,6 @@ async fn serve_favicon(
 }
 
 /// Serves a static asset from `site_root`.
-///
-/// Split out from [`serve_favicon`] so tests can point at a temporary directory
-/// directly instead of mutating process-global environment state, which is both
-/// unsafe under edition 2024 and racy across concurrently running tests.
 #[cfg(feature = "ssr")]
 async fn serve_favicon_at(
     request: axum::extract::Request,
@@ -171,9 +171,6 @@ async fn serve_favicon_at(
 }
 
 /// Parses a comma-separated whitelist of IPs or CIDR ranges.
-///
-/// Only the SSR binary uses this, so it is gated out of a client-only build
-/// where it would otherwise be reported as dead code.
 #[cfg(feature = "ssr")]
 fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
     if whitelist.is_empty() {
@@ -651,6 +648,18 @@ mod tests {
             entries,
             vec!["first.pdf".to_string()],
             "only the accepted upload should be on disk"
+        );
+
+        // Streaming stages every upload before the dedup check commits it, so
+        // the staging directory must be empty afterwards. A leftover here would
+        // mean an upload's bytes are on disk with no database row.
+        let staged: Vec<_> = std::fs::read_dir(format!("{}/files/.incoming", db_dir))
+            .expect("staging directory should exist")
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "staging directory should be empty, found: {staged:?}"
         );
     }
 
