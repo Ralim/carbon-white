@@ -26,228 +26,6 @@ use crate::{
     AppState,
 };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ip_subnet::IPSubnet;
-    use axum::http::{HeaderMap, HeaderValue};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    #[test]
-    fn test_ip_whitelist_with_headers() {
-        // Whitelist contains 192.168.1.1
-        let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
-
-        // X-Forwarded-For header present
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1"));
-        let ip = get_client_ip(&headers, connect_info);
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
-
-        // X-Real-IP header present
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.1"));
-        let ip = get_client_ip(&headers, connect_info);
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
-
-        // Not whitelisted
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
-        let ip = get_client_ip(&headers, connect_info);
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(!is_ip_whitelisted(ip.unwrap(), &whitelist));
-    }
-
-    #[test]
-    fn test_ip_whitelist_with_connect_info_fallback() {
-        // Simulate no headers, fallback to ConnectInfo
-        let whitelist = vec![IPSubnet::try_from("127.0.0.1/32").unwrap()];
-        let headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
-        let client_ip = get_client_ip(&headers, connect_info);
-        assert_eq!(client_ip, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(is_ip_whitelisted(client_ip.unwrap(), &whitelist));
-    }
-
-    #[test]
-    fn test_ip_whitelist_empty_allows_localhost() {
-        let whitelist = vec![];
-        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        let local = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        assert!(is_ip_whitelisted(local, &whitelist));
-        assert!(!is_ip_whitelisted(ip, &whitelist));
-    }
-
-    #[test]
-    fn test_search_result_creation() {
-        let result = SearchResult {
-            title: "Test Document".to_string(),
-            part_number: "PN123".to_string(),
-            manufacturer: "Test Corp".to_string(),
-            document_id: "DOC001".to_string(),
-            document_version: "1.0".to_string(),
-            package_marking: "QFN32".to_string(),
-            device_address: "0x48".to_string(),
-            notes: "Test notes".to_string(),
-            storage_date: "2024-01-01".to_string(),
-            original_file_name: "test.pdf".to_string(),
-            file_sha256: "abcd1234".to_string(),
-        };
-
-        assert_eq!(result.title, "Test Document");
-        assert_eq!(result.part_number, "PN123");
-        assert_eq!(result.manufacturer, "Test Corp");
-    }
-
-    #[test]
-    fn test_search_response_creation() {
-        let response = SearchResponse {
-            results: vec![],
-            duration_ms: 50,
-        };
-
-        assert_eq!(response.results.len(), 0);
-        assert_eq!(response.duration_ms, 50);
-    }
-
-    #[test]
-    fn test_submit_response_creation() {
-        let response = SubmitResponse {
-            success: true,
-            message: "File uploaded successfully".to_string(),
-            file_sha256: Some("abcd1234".to_string()),
-        };
-
-        assert!(response.success);
-        assert_eq!(response.message, "File uploaded successfully");
-        assert_eq!(response.file_sha256.unwrap(), "abcd1234");
-    }
-
-    #[test]
-    fn test_auth_status_response() {
-        let response = AuthStatusResponse {
-            authenticated: true,
-        };
-
-        assert!(response.authenticated);
-    }
-
-    #[test]
-    fn test_search_query_deserialization() {
-        // This would typically be tested with actual JSON deserialization
-        let query = SearchQuery {
-            q: "test search".to_string(),
-        };
-
-        assert_eq!(query.q, "test search");
-    }
-
-    #[test]
-    fn test_auth_request_creation() {
-        let request = AuthRequest {
-            auth_key: "test_key".to_string(),
-        };
-
-        assert_eq!(request.auth_key, "test_key");
-    }
-
-    #[test]
-    fn test_auth_response_success() {
-        let response = AuthResponse {
-            success: true,
-            message: "Authentication successful".to_string(),
-            token: Some("test_token".to_string()),
-        };
-
-        assert!(response.success);
-        assert_eq!(response.message, "Authentication successful");
-        assert_eq!(response.token.unwrap(), "test_token");
-    }
-
-    #[test]
-    fn test_auth_response_failure() {
-        let response = AuthResponse {
-            success: false,
-            message: "Invalid auth key".to_string(),
-            token: None,
-        };
-
-        assert!(!response.success);
-        assert_eq!(response.message, "Invalid auth key");
-        assert!(response.token.is_none());
-    }
-
-    #[test]
-    fn test_file_size_limit_check() {
-        // Test that our file size limit constant is reasonable
-        const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB
-
-        // Should accept reasonable file sizes
-        let small_file_size = 1024; // 1KB
-        let medium_file_size = 5 * 1024 * 1024; // 5MB
-        let large_file_size = 50 * 1024 * 1024; // 50MB
-
-        assert!(small_file_size <= MAX_FILE_SIZE);
-        assert!(medium_file_size <= MAX_FILE_SIZE);
-        assert!(large_file_size <= MAX_FILE_SIZE);
-
-        // Should reject oversized files
-        let oversized_file = 150 * 1024 * 1024; // 150MB
-        assert!(oversized_file > MAX_FILE_SIZE);
-    }
-
-    #[test]
-    fn test_submit_response_file_too_large() {
-        let response = SubmitResponse {
-            success: false,
-            message: "File size exceeds 100MB limit".to_string(),
-            file_sha256: None,
-        };
-
-        assert!(!response.success);
-        assert_eq!(response.message, "File size exceeds 100MB limit");
-        assert!(response.file_sha256.is_none());
-    }
-
-    #[test]
-    fn test_search_query_empty_string() {
-        let query = SearchQuery { q: "".to_string() };
-
-        assert_eq!(query.q, "");
-        assert!(query.q.trim().is_empty());
-    }
-
-    #[test]
-    fn test_search_response_recent_files() {
-        // Test response structure for recent files (same as search results)
-        let recent_result = SearchResult {
-            title: "Recent Document".to_string(),
-            part_number: "RPN123".to_string(),
-            manufacturer: "Recent Corp".to_string(),
-            document_id: "RDOC001".to_string(),
-            document_version: "1.0".to_string(),
-            package_marking: "QFN64".to_string(),
-            device_address: "0x50".to_string(),
-            notes: "Recent file notes".to_string(),
-            storage_date: "2024-01-15".to_string(),
-            original_file_name: "recent.pdf".to_string(),
-            file_sha256: "recent_hash_123".to_string(),
-        };
-
-        let response = SearchResponse {
-            results: vec![recent_result],
-            duration_ms: 25,
-        };
-
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].title, "Recent Document");
-        assert_eq!(response.duration_ms, 25);
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
     pub q: String,
@@ -801,6 +579,287 @@ async fn authenticate_request(headers: &HeaderMap, _state: &AppState) -> bool {
                 return crate::auth::verify_jwt_token(token).is_ok();
             }
         }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip_subnet::IPSubnet;
+    use axum::http::{HeaderMap, HeaderValue};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn test_ip_whitelist_with_headers() {
+        // Whitelist contains 192.168.1.1
+        let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
+        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+
+        // X-Forwarded-For header present
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1"));
+        let ip = get_client_ip(&headers, connect_info);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
+
+        // X-Real-IP header present
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.1"));
+        let ip = get_client_ip(&headers, connect_info);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
+
+        // Not whitelisted
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        let ip = get_client_ip(&headers, connect_info);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_ip_whitelisted(ip.unwrap(), &whitelist));
+    }
+
+    #[test]
+    fn test_ip_whitelist_with_connect_info_fallback() {
+        // Simulate no headers, fallback to ConnectInfo
+        let whitelist = vec![IPSubnet::try_from("127.0.0.1/32").unwrap()];
+        let headers = HeaderMap::new();
+        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let client_ip = get_client_ip(&headers, connect_info);
+        assert_eq!(client_ip, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_ip_whitelisted(client_ip.unwrap(), &whitelist));
+    }
+
+    #[test]
+    fn test_ip_whitelist_empty_allows_localhost() {
+        let whitelist = vec![];
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let local = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert!(is_ip_whitelisted(local, &whitelist));
+        assert!(!is_ip_whitelisted(ip, &whitelist));
+    }
+
+    #[test]
+    fn test_search_result_creation() {
+        let result = SearchResult {
+            title: "Test Document".to_string(),
+            part_number: "PN123".to_string(),
+            manufacturer: "Test Corp".to_string(),
+            document_id: "DOC001".to_string(),
+            document_version: "1.0".to_string(),
+            package_marking: "QFN32".to_string(),
+            device_address: "0x48".to_string(),
+            notes: "Test notes".to_string(),
+            storage_date: "2024-01-01".to_string(),
+            original_file_name: "test.pdf".to_string(),
+            file_sha256: "abcd1234".to_string(),
+        };
+
+        assert_eq!(result.title, "Test Document");
+        assert_eq!(result.part_number, "PN123");
+        assert_eq!(result.manufacturer, "Test Corp");
+    }
+
+    #[test]
+    fn test_search_response_creation() {
+        let response = SearchResponse {
+            results: vec![],
+            duration_ms: 50,
+        };
+
+        assert_eq!(response.results.len(), 0);
+        assert_eq!(response.duration_ms, 50);
+    }
+
+    #[test]
+    fn test_submit_response_creation() {
+        let response = SubmitResponse {
+            success: true,
+            message: "File uploaded successfully".to_string(),
+            file_sha256: Some("abcd1234".to_string()),
+        };
+
+        assert!(response.success);
+        assert_eq!(response.message, "File uploaded successfully");
+        assert_eq!(response.file_sha256.unwrap(), "abcd1234");
+    }
+
+    #[test]
+    fn test_auth_status_response() {
+        let response = AuthStatusResponse {
+            authenticated: true,
+        };
+
+        assert!(response.authenticated);
+    }
+
+    #[test]
+    fn test_search_query_deserialization() {
+        // This would typically be tested with actual JSON deserialization
+        let query = SearchQuery {
+            q: "test search".to_string(),
+        };
+
+        assert_eq!(query.q, "test search");
+    }
+
+    #[test]
+    fn test_auth_request_creation() {
+        let request = AuthRequest {
+            auth_key: "test_key".to_string(),
+        };
+
+        assert_eq!(request.auth_key, "test_key");
+    }
+
+    #[test]
+    fn test_auth_response_success() {
+        let response = AuthResponse {
+            success: true,
+            message: "Authentication successful".to_string(),
+            token: Some("test_token".to_string()),
+        };
+
+        assert!(response.success);
+        assert_eq!(response.message, "Authentication successful");
+        assert_eq!(response.token.unwrap(), "test_token");
+    }
+
+    #[test]
+    fn test_auth_response_failure() {
+        let response = AuthResponse {
+            success: false,
+            message: "Invalid auth key".to_string(),
+            token: None,
+        };
+
+        assert!(!response.success);
+        assert_eq!(response.message, "Invalid auth key");
+        assert!(response.token.is_none());
+    }
+
+    #[test]
+    fn test_file_size_limit_check() {
+        // Test that our file size limit constant is reasonable
+        const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB
+
+        // Should accept reasonable file sizes
+        let small_file_size = 1024; // 1KB
+        let medium_file_size = 5 * 1024 * 1024; // 5MB
+        let large_file_size = 50 * 1024 * 1024; // 50MB
+
+        assert!(small_file_size <= MAX_FILE_SIZE);
+        assert!(medium_file_size <= MAX_FILE_SIZE);
+        assert!(large_file_size <= MAX_FILE_SIZE);
+
+        // Should reject oversized files
+        let oversized_file = 150 * 1024 * 1024; // 150MB
+        assert!(oversized_file > MAX_FILE_SIZE);
+    }
+
+    #[test]
+    fn test_submit_response_file_too_large() {
+        let response = SubmitResponse {
+            success: false,
+            message: "File size exceeds 100MB limit".to_string(),
+            file_sha256: None,
+        };
+
+        assert!(!response.success);
+        assert_eq!(response.message, "File size exceeds 100MB limit");
+        assert!(response.file_sha256.is_none());
+    }
+
+    #[test]
+    fn test_search_query_empty_string() {
+        let query = SearchQuery { q: "".to_string() };
+
+        assert_eq!(query.q, "");
+        assert!(query.q.trim().is_empty());
+    }
+
+    #[test]
+    fn test_search_response_recent_files() {
+        // Test response structure for recent files (same as search results)
+        let recent_result = SearchResult {
+            title: "Recent Document".to_string(),
+            part_number: "RPN123".to_string(),
+            manufacturer: "Recent Corp".to_string(),
+            document_id: "RDOC001".to_string(),
+            document_version: "1.0".to_string(),
+            package_marking: "QFN64".to_string(),
+            device_address: "0x50".to_string(),
+            notes: "Recent file notes".to_string(),
+            storage_date: "2024-01-15".to_string(),
+            original_file_name: "recent.pdf".to_string(),
+            file_sha256: "recent_hash_123".to_string(),
+        };
+
+        let response = SearchResponse {
+            results: vec![recent_result],
+            duration_ms: 25,
+        };
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].title, "Recent Document");
+        assert_eq!(response.duration_ms, 25);
+    }
+
+    #[test]
+    fn test_sanitize_upload_filename_preserves_normal_names() {
+        assert_eq!(sanitize_upload_filename("normal.pdf"), "normal.pdf");
+        assert_eq!(
+            sanitize_upload_filename("file with spaces.doc"),
+            "file with spaces.doc"
+        );
+        assert_eq!(sanitize_upload_filename("a.b.c.tar.gz"), "a.b.c.tar.gz");
+    }
+
+    #[test]
+    fn test_sanitize_upload_filename_strips_path_traversal() {
+        // The basename is all that should survive; the directory part is dropped.
+        assert_eq!(sanitize_upload_filename("../../../../etc/passwd"), "passwd");
+        assert_eq!(
+            sanitize_upload_filename("..\\..\\windows\\system32"),
+            "system32"
+        );
+        // An absolute path must not escape the storage directory.
+        assert_eq!(sanitize_upload_filename("/etc/shadow"), "shadow");
+        assert_eq!(
+            sanitize_upload_filename("C:\\Windows\\evil.exe"),
+            "evil.exe"
+        );
+        // Mixed separators.
+        assert_eq!(sanitize_upload_filename("../foo/../../bar.txt"), "bar.txt");
+    }
+
+    #[test]
+    fn test_sanitize_upload_filename_replaces_unsafe_characters() {
+        assert_eq!(sanitize_upload_filename("a\0b.txt"), "a_b.txt");
+        assert_eq!(sanitize_upload_filename("re:po|rt?.txt"), "re_po_rt_.txt");
+        assert_eq!(sanitize_upload_filename("file\x01\x1f.txt"), "file__.txt");
+    }
+
+    #[test]
+    fn test_sanitize_upload_filename_never_returns_empty_or_relative() {
+        // Anything that would reduce to nothing falls back to a safe default.
+        assert_eq!(sanitize_upload_filename(""), "upload");
+        assert_eq!(sanitize_upload_filename("   "), "upload");
+        assert_eq!(sanitize_upload_filename("."), "upload");
+        assert_eq!(sanitize_upload_filename(".."), "upload");
+        assert_eq!(sanitize_upload_filename("/"), "upload");
+        assert_eq!(sanitize_upload_filename("..."), "upload");
+    }
+
+    #[test]
+    fn test_sanitize_upload_filename_truncates_without_splitting_utf8() {
+        // Long names are clamped, and the result stays valid UTF-8.
+        let long = "ф".repeat(500);
+        let result = sanitize_upload_filename(&long);
+        assert!(result.len() <= MAX_FILENAME_LEN);
+        assert!(result.is_char_boundary(result.len()));
+
+        // A multi-byte char straddling the truncation boundary must not panic.
+        let boundary = "a".repeat(MAX_FILENAME_LEN - 1) + "ф";
+        let result = sanitize_upload_filename(&boundary);
+        assert!(result.len() <= MAX_FILENAME_LEN);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
     false
 }
