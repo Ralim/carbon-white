@@ -68,17 +68,35 @@ pub fn NotFound() -> impl IntoView {
     }
 }
 
+#[cfg(feature = "ssr")]
+pub fn shell(options: LeptosOptions) -> impl IntoView {
+    use leptos::prelude::*;
+
+    view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <AutoReload options=options.clone()/>
+                <HydrationScripts options/>
+                <MetaTags/>
+            </head>
+            <body>
+                <App/>
+            </body>
+        </html>
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Tests don't need any additional imports beyond what's already in scope
 
     #[test]
-    fn test_app_component_renders() {
-        // Test that the App component function exists and can be called
-        // This is a basic compilation test
+    fn test_app_component_is_callable() {
+        // Referencing the component proves it is exported and its props type-check.
         let _app_fn = App;
-        assert!(true);
     }
 
     #[test]
@@ -100,26 +118,5 @@ mod tests {
         // Verify the app source contains the title
         let source_code = include_str!("app.rs");
         assert!(source_code.contains("Carbon White"));
-    }
-}
-
-#[cfg(feature = "ssr")]
-pub fn shell(options: LeptosOptions) -> impl IntoView {
-    use leptos::prelude::*;
-
-    view! {
-        <!DOCTYPE html>
-        <html lang="en">
-            <head>
-                <meta charset="utf-8"/>
-                <meta name="viewport" content="width=device-width, initial-scale=1"/>
-                <AutoReload options=options.clone()/>
-                <HydrationScripts options/>
-                <MetaTags/>
-            </head>
-            <body>
-                <App/>
-            </body>
-        </html>
     }
 }

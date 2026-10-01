@@ -174,6 +174,7 @@ mod tests {
     use carbon_white::{api, database, file_server, App, AppState};
     use leptos::prelude::get_configuration;
     use leptos_axum::generate_route_list;
+    use std::net::SocketAddr;
 
     #[test]
     fn test_parse_ip_whitelist_empty() {
@@ -239,12 +240,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_components() {
-        // Set environment variables for test
-        std::env::set_var("CARBON_DATA_DIR", "/tmp/test_carbon/");
-        std::env::set_var("CARBON_AUTH_KEY", "test_key");
-        std::env::set_var("CARBON_WHITELIST_IPS", "127.0.0.1");
+        use tempfile::tempdir;
 
-        // Create a test configuration
+        // Create a test configuration. The Leptos options are derived from the
+        // build environment rather than these variables, so no process-global
+        // env is mutated here; doing so would race with other tests.
         let conf = get_configuration(None).unwrap();
         let _leptos_options = conf.leptos_options;
 
@@ -252,10 +252,9 @@ mod tests {
         let routes = generate_route_list(App);
         assert!(!routes.is_empty(), "Routes should not be empty");
 
-        // Create app state
-        let temp_dir = std::env::temp_dir().join("carbon_test");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let temp_path = temp_dir.to_string_lossy().to_string();
+        // Create app state in a self-cleaning directory
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
 
         let database = database::init_db(&temp_path)
             .await
@@ -275,11 +274,6 @@ mod tests {
         // Verify app state values
         assert_eq!(app_state.auth_key, "test_auth_key");
         assert_eq!(app_state.whitelist_ips.len(), 1);
-
-        // Clean up
-        std::env::remove_var("CARBON_DATA_DIR");
-        std::env::remove_var("CARBON_AUTH_KEY");
-        std::env::remove_var("CARBON_WHITELIST_IPS");
     }
 
     #[tokio::test]
@@ -311,6 +305,7 @@ mod tests {
     #[tokio::test]
     async fn test_authentication_flow_end_to_end() {
         use axum::body::Body;
+        use axum::extract::ConnectInfo;
         use axum::http::{Method, Request, StatusCode};
 
         use serde_json::json;
@@ -330,11 +325,16 @@ mod tests {
             database,
             data_dir: temp_path,
             auth_key: "test_auth_key_123".to_string(),
-            whitelist_ips: vec![], // Empty whitelist allows all IPs
+            whitelist_ips: vec![], // Empty whitelist allows loopback only
         };
 
         // Create API router
         let api_router = api::create_api_routes().with_state(app_state);
+
+        // The router under test is not wrapped by `into_make_service_with_connect_info`,
+        // so the peer address is injected directly via request extensions, which is
+        // where the `ConnectInfo` extractor reads it from.
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 40000));
 
         // Test 1: Authentication with valid key should return token
         let auth_request = Request::builder()
@@ -345,6 +345,8 @@ mod tests {
                 json!({"auth_key": "test_auth_key_123"}).to_string(),
             ))
             .unwrap();
+        let mut auth_request = auth_request;
+        auth_request.extensions_mut().insert(ConnectInfo(loopback));
 
         let auth_response = api_router.clone().oneshot(auth_request).await.unwrap();
         assert_eq!(auth_response.status(), StatusCode::OK);
@@ -366,6 +368,10 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(json!({"auth_key": "wrong_key"}).to_string()))
             .unwrap();
+        let mut invalid_auth_request = invalid_auth_request;
+        invalid_auth_request
+            .extensions_mut()
+            .insert(ConnectInfo(loopback));
 
         let invalid_auth_response = api_router
             .clone()
@@ -419,6 +425,55 @@ mod tests {
             .unwrap();
         let no_token_result: serde_json::Value = serde_json::from_slice(&no_token_body).unwrap();
         assert_eq!(no_token_result["authenticated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_non_whitelisted_ip() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request};
+        use serde_json::json;
+        use tempfile::tempdir;
+        use tower::ServiceExt;
+
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        let app_state = AppState {
+            database: database::init_db(&temp_path)
+                .await
+                .expect("Failed to initialize test database"),
+            data_dir: temp_path,
+            auth_key: "test_auth_key_123".to_string(),
+            whitelist_ips: vec![],
+        };
+
+        let api_router = api::create_api_routes().with_state(app_state);
+
+        // A non-loopback client must be refused even with the correct key.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/auth")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"auth_key": "test_auth_key_123"}).to_string(),
+            ))
+            .unwrap();
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40000))));
+
+        let response = api_router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(result["success"], false);
+        assert!(result["token"].is_null());
     }
 
     #[tokio::test]
@@ -538,7 +593,7 @@ mod tests {
         ];
 
         for (filename, expected_mime) in test_cases {
-            let detected_mime = match filename.split('.').last() {
+            let detected_mime = match filename.rsplit('.').next() {
                 Some("ico") => "image/x-icon",
                 Some("png") => "image/png",
                 Some("webmanifest") => "application/manifest+json",
