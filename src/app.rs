@@ -120,4 +120,23 @@ mod tests {
         let source_code = include_str!("app.rs");
         assert!(source_code.contains("Carbon White"));
     }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn test_all_route_is_registered() {
+        use leptos_axum::generate_route_list;
+
+        let routes = generate_route_list(App);
+        let paths: Vec<String> = routes.iter().map(|r| r.path().to_string()).collect();
+
+        assert!(
+            paths.iter().any(|p| p == "/all"),
+            "the /all route must be registered, found: {paths:?}"
+        );
+        // The pre-existing routes must survive alongside it.
+        assert!(paths.iter().any(|p| p == "/"));
+        assert!(paths.iter().any(|p| p == "/login"));
+        assert!(paths.iter().any(|p| p.starts_with("/submit")));
+        assert!(paths.iter().any(|p| p.starts_with("/edit")));
+    }
 }

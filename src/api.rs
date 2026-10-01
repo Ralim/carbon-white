@@ -315,6 +315,7 @@ pub async fn handle_list(
         Ok(page_data) => {
             let duration = start_time.elapsed().as_millis();
             let total_pages = page_data.total_pages();
+            // Read the metadata before `documents` is consumed by `into_iter`.
             let (page_number, per_page, total, has_previous, has_next) = (
                 page_data.page,
                 page_data.per_page,
@@ -458,6 +459,24 @@ pub async fn handle_submit(
         original_filename, file_hash
     );
 
+    // Reject an identical file before writing anything to disk, so a duplicate
+    // cannot overwrite the stored copy or leave orphaned bytes behind.
+    match database::document_exists_by_sha256(&state.database, &file_hash).await {
+        Ok(true) => {
+            warn!("Rejected duplicate upload: {}", file_hash);
+            return Ok(Json(SubmitResponse {
+                success: false,
+                message: "This file has already been uploaded.".to_string(),
+                file_sha256: Some(file_hash),
+            }));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            error!("Failed to check for an existing document: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
     // Create file storage directory
     let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
 
@@ -502,12 +521,23 @@ pub async fn handle_submit(
         file_path: file_path.to_string_lossy().to_string(),
     };
 
-    match database::insert_or_update_document(&state.database, new_document).await {
-        Ok(id) => {
+    match database::insert_document_if_absent(&state.database, new_document).await {
+        Ok(Some(id)) => {
             info!("Document {} stored successfully with ID: {}", title, id);
             Ok(Json(SubmitResponse {
                 success: true,
                 message: "Document uploaded successfully".to_string(),
+                file_sha256: Some(file_hash),
+            }))
+        }
+        // Lost a race against a concurrent upload of the same file. Drop the
+        // bytes we just wrote so the stored copy is not duplicated on disk.
+        Ok(None) => {
+            warn!("Duplicate upload rejected during insert: {}", file_hash);
+            let _ = tokio::fs::remove_file(&file_path).await;
+            Ok(Json(SubmitResponse {
+                success: false,
+                message: "This file has already been uploaded.".to_string(),
                 file_sha256: Some(file_hash),
             }))
         }
