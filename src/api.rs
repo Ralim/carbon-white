@@ -18,8 +18,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth::{
-        create_jwt_token, get_client_ip, is_ip_whitelisted, validate_auth_key, AuthRequest,
-        AuthResponse,
+        create_jwt_token_with_secret, extract_token_from_headers, get_client_ip, is_ip_whitelisted,
+        validate_auth_key, verify_jwt_token_with_secret, AuthRequest, AuthResponse,
     },
     database::{self, NewDocument},
     shared::AuthStatusResponse,
@@ -114,7 +114,7 @@ pub async fn handle_auth(
     }
 
     // Generate JWT token
-    match create_jwt_token() {
+    match create_jwt_token_with_secret(state.auth_key.as_bytes()) {
         Ok(token) => {
             info!("Authentication successful, token generated");
 
@@ -134,13 +134,9 @@ pub async fn handle_auth(
 pub async fn handle_auth_status(
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, StatusCode> {
-    use crate::auth::{extract_token_from_headers, verify_jwt_token};
-
-    let token = extract_token_from_headers(&headers);
-    let authenticated = match token {
-        Some(token) => verify_jwt_token(&token).is_ok(),
-        None => false,
-    };
+    let authenticated = extract_token_from_headers(&headers)
+        .map(|token| verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token).is_ok())
+        .unwrap_or(false);
 
     Ok(Json(AuthStatusResponse { authenticated }))
 }
@@ -454,7 +450,7 @@ pub async fn handle_get_document(
     AxumPath(sha256): AxumPath<String>,
 ) -> Result<Json<DocumentResponse>, StatusCode> {
     // Authenticate the user
-    if !authenticate_request(&headers, &state).await {
+    if !authenticate_request(&headers, &state) {
         warn!(
             "Unauthorized document retrieval attempt for SHA256: {}",
             sha256
@@ -505,7 +501,7 @@ pub async fn handle_update_document(
     Json(update_request): Json<UpdateDocumentRequest>,
 ) -> Result<Json<UpdateResponse>, StatusCode> {
     // Authenticate the user
-    if !authenticate_request(&headers, &state).await {
+    if !authenticate_request(&headers, &state) {
         warn!(
             "Unauthorized document update attempt for SHA256: {}",
             sha256
@@ -572,13 +568,18 @@ pub async fn handle_update_document(
     }
 }
 
-async fn authenticate_request(headers: &HeaderMap, _state: &AppState) -> bool {
-    if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                return crate::auth::verify_jwt_token(token).is_ok();
-            }
-        }
+/// Checks the bearer token on a request against the configured auth key.
+///
+/// Returns `true` only when a well-formed `Authorization: Bearer <token>` header
+/// carries a token that verifies and has not expired.
+fn authenticate_request(headers: &HeaderMap, state: &AppState) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|token| verify_jwt_token_with_secret(state.auth_key.as_bytes(), token).is_ok())
+        .unwrap_or(false)
+}
 
 #[cfg(test)]
 mod tests {
@@ -861,5 +862,4 @@ mod tests {
         assert!(result.len() <= MAX_FILENAME_LEN);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
-    false
 }

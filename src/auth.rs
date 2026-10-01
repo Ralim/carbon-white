@@ -7,17 +7,9 @@ use axum::{
     response::Response,
 };
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use tracing::{error, info, warn};
-
-static JWT_SECRET: Lazy<Vec<u8>> = Lazy::new(|| {
-    env::var("CARBON_AUTH_KEY")
-        .expect("CARBON_AUTH_KEY must be set in environment")
-        .into_bytes()
-});
 
 const JWT_EXPIRATION_HOURS: i64 = 24;
 
@@ -40,7 +32,7 @@ pub struct AuthResponse {
     pub token: Option<String>,
 }
 
-pub fn create_jwt_token() -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
     let now = chrono::Utc::now();
     let exp = now + chrono::Duration::hours(JWT_EXPIRATION_HOURS);
 
@@ -53,14 +45,17 @@ pub fn create_jwt_token() -> Result<String, jsonwebtoken::errors::Error> {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(&JWT_SECRET),
+        &EncodingKey::from_secret(secret),
     )
 }
 
-pub fn verify_jwt_token(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+pub fn verify_jwt_token_with_secret(
+    secret: &[u8],
+    token: &str,
+) -> Result<Claims, jsonwebtoken::errors::Error> {
     let validation = Validation::new(Algorithm::HS256);
 
-    decode::<Claims>(token, &DecodingKey::from_secret(&JWT_SECRET), &validation)
+    decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)
         .map(|token_data| token_data.claims)
 }
 
@@ -92,7 +87,7 @@ pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 pub async fn auth_middleware(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
     next: Next,
@@ -113,7 +108,7 @@ pub async fn auth_middleware(
     };
 
     // Verify token
-    match verify_jwt_token(&token) {
+    match verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token) {
         Ok(claims) => {
             info!("Valid token for user: {} accessing {}", claims.sub, path);
             Ok(next.run(request).await)
@@ -232,14 +227,16 @@ pub fn get_client_ip(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> O
 #[cfg(test)]
 mod test_auth {
     use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use std::str::FromStr;
 
     #[test]
     fn test_create_and_verify_jwt_token() {
-        let token = create_jwt_token().unwrap();
+        let secret = b"test-secret-for-unit-tests";
+        let token = create_jwt_token_with_secret(secret).unwrap();
         assert!(!token.is_empty());
 
-        let claims = verify_jwt_token(&token).unwrap();
+        let claims = verify_jwt_token_with_secret(secret, &token).unwrap();
         assert_eq!(claims.sub, "carbon_white_user");
 
         // Check that expiration is in the future
@@ -250,8 +247,62 @@ mod test_auth {
 
     #[test]
     fn test_verify_invalid_token() {
-        let result = verify_jwt_token("invalid.token.here");
-        assert!(result.is_err());
+        let secret = b"test-secret-for-unit-tests";
+        assert!(verify_jwt_token_with_secret(secret, "invalid.token.here").is_err());
+    }
+
+    #[test]
+    fn test_token_signed_with_other_secret_is_rejected() {
+        let token = create_jwt_token_with_secret(b"secret-a").unwrap();
+        assert!(verify_jwt_token_with_secret(b"secret-b", &token).is_err());
+    }
+
+    #[test]
+    fn test_expired_token_is_rejected() {
+        // A token whose `exp` is already in the past must fail verification,
+        // otherwise a leaked token would be valid forever.
+        let secret = b"test-secret-for-unit-tests";
+        let claims = Claims {
+            sub: "carbon_white_user".to_string(),
+            exp: (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize,
+            iat: (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp() as usize,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+
+        assert!(verify_jwt_token_with_secret(secret, &token).is_err());
+    }
+
+    #[test]
+    fn test_tampered_token_is_rejected() {
+        let secret = b"test-secret-for-unit-tests";
+        let token = create_jwt_token_with_secret(secret).unwrap();
+
+        // Flip a character in the signature segment.
+        let mut parts: Vec<String> = token.split('.').map(str::to_string).collect();
+        let replacement = if parts[2].starts_with('a') { "b" } else { "a" };
+        parts[2].replace_range(0..1, replacement);
+        let tampered = parts.join(".");
+
+        assert!(verify_jwt_token_with_secret(secret, &tampered).is_err());
+    }
+
+    #[test]
+    fn test_token_lifetime_is_bounded() {
+        let secret = b"test-secret-for-unit-tests";
+        let token = create_jwt_token_with_secret(secret).unwrap();
+        let claims = verify_jwt_token_with_secret(secret, &token).unwrap();
+
+        let lifetime = claims.exp - claims.iat;
+        assert_eq!(
+            lifetime as i64,
+            JWT_EXPIRATION_HOURS * 3600,
+            "token should live for exactly JWT_EXPIRATION_HOURS"
+        );
     }
 
     #[test]
@@ -263,6 +314,19 @@ mod test_auth {
         assert!(!validate_auth_key("", expected_key));
         assert!(!validate_auth_key("secret123", ""));
         assert!(!validate_auth_key("secret12", expected_key)); // Different length
+    }
+
+    #[test]
+    fn test_validate_auth_key_rejects_mismatch_at_any_position() {
+        let expected = "abcdefgh";
+        for i in 0..expected.len() {
+            let mut provided = expected.to_string();
+            provided.replace_range(i..=i, "X");
+            assert!(
+                !validate_auth_key(&provided, expected),
+                "key differing at byte {i} must not validate"
+            );
+        }
     }
 
     #[test]
@@ -314,6 +378,23 @@ mod test_auth {
         assert!(!is_public_endpoint("/submit"));
         assert!(!is_public_endpoint("/api/submit"));
         assert!(!is_public_endpoint("/admin"));
+    }
+
+    #[test]
+    fn test_is_public_endpoint_root_is_exact_match() {
+        // A prefix-style match on `/` would expose every route, so only the
+        // bare root may be public.
+        assert!(!is_public_endpoint("/submit"));
+        assert!(!is_public_endpoint("/anything-else"));
+    }
+
+    #[test]
+    fn test_is_public_endpoint_prefix_paths() {
+        // Prefix entries are anchored on the trailing slash, so a sibling path
+        // that merely shares the prefix must not become public.
+        assert!(is_public_endpoint("/file/deadbeef"));
+        assert!(!is_public_endpoint("/files/deadbeef"));
+        assert!(!is_public_endpoint("/pkgfiles/app.js"));
     }
 
     #[test]
