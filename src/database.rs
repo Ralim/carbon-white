@@ -1,4 +1,5 @@
 use sqlx::{FromRow, Row, Sqlite, SqlitePool, migrate::MigrateDatabase, sqlite::SqlitePoolOptions};
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::info;
 
@@ -15,9 +16,6 @@ pub async fn init_db(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
     // The pool is configured with `after_connect` because these settings are
     // per-connection.
     let pool = SqlitePoolOptions::new()
-        // SQLite serialises writers regardless of pool size, so a large pool
-        // mostly adds lock contention on the upload path. A small pool keeps
-        // the write lock predictable while WAL still allows concurrent reads.
         .max_connections(5)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
@@ -55,13 +53,11 @@ pub async fn init_db(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
         ));
     }
 
-    // Run migrations. Order matters: each step is guarded by `user_version` and
-    // advances it, so a step that ran first would cause a later step to believe
-    // it had already been applied. The FTS backfill must therefore run before
-    // the column drop, which is the step that records the higher version.
+    // Run migrations
     create_tables(&pool).await?;
     create_fts_index(&pool).await?;
     drop_unused_columns(&pool).await?;
+    create_part_number_index(&pool).await?;
 
     info!("Database initialized successfully");
     Ok(pool)
@@ -90,12 +86,6 @@ async fn create_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // The per-column indexes on title, part_number, and manufacturer predate the
-    // FTS5 index and no longer back any query. Search is answered from
-    // documents_fts, pagination orders by the `id` primary key, and lookups go
-    // through the UNIQUE index on file_sha256. Maintaining three more B-trees on
-    // every insert and metadata edit is pure write overhead, so they are dropped
-    // rather than recreated.
     sqlx::query(
         r#"
         DROP INDEX IF EXISTS idx_documents_title;
@@ -123,6 +113,12 @@ const FTS_SCHEMA_VERSION: i64 = 1;
 /// `updated_at`.
 const UNUSED_COLUMNS_SCHEMA_VERSION: i64 = 2;
 
+/// `user_version` value recorded once the part number trigram index is populated.
+const PART_NUMBER_INDEX_SCHEMA_VERSION: i64 = 3;
+
+/// Rows a single search returns at most.
+const SEARCH_RESULT_LIMIT: i64 = 100;
+
 /// Reads the schema version recorded in the database header.
 async fn schema_version(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("PRAGMA user_version")
@@ -133,8 +129,7 @@ async fn schema_version(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
 /// Records the schema version once a migration step has succeeded.
 async fn set_schema_version(pool: &SqlitePool, version: i64) -> Result<(), sqlx::Error> {
     // `PRAGMA user_version` does not accept a bound parameter, so the value is
-    // interpolated. It is always a compile-time constant, never user input;
-    // `AssertSqlSafe` records that for sqlx's injection check.
+    // interpolated.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "PRAGMA user_version = {version};"
     )))
@@ -156,16 +151,6 @@ async fn column_exists(pool: &SqlitePool, column: &str) -> Result<bool, sqlx::Er
 }
 
 /// Drops `created_at` and `updated_at` from databases that still carry them.
-///
-/// Neither column is read anywhere in the application. `created_at` was only
-/// used by two query helpers that had no callers, and `updated_at` was written
-/// on insert and edit but never read back. Both are removed so the table matches
-/// the [`Document`] struct exactly and stops paying to store them.
-///
-/// The version guard keeps this to databases created before the change; a
-/// freshly created table never has these columns in the first place. Each
-/// `DROP COLUMN` is additionally checked against `PRAGMA table_info` so a
-/// partially migrated database converges instead of erroring.
 async fn drop_unused_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     if schema_version(pool).await? >= UNUSED_COLUMNS_SCHEMA_VERSION {
         return Ok(());
@@ -186,6 +171,77 @@ async fn drop_unused_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     set_schema_version(pool, UNUSED_COLUMNS_SCHEMA_VERSION).await?;
+    Ok(())
+}
+
+/// Creates a trigram index over `part_number` alone and keeps it in sync.
+///
+/// The main index tokenises on word boundaries, so it matches a part number only
+/// from its start: searching `555` finds `PN-5550`, but `550` does not. People
+/// look up parts by a fragment from anywhere in the number, so this index stores
+/// every three-character sequence of the part number and answers substring
+/// queries from it.
+///
+/// Deliberately scoped to `part_number`.
+async fn create_part_number_index(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts_pn USING fts5(
+            part_number,
+            content='documents',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Same external-content arrangement as the main index, so the triggers have
+    // to restate the old value when a part number is edited.
+    sqlx::query(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS documents_pn_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts_pn(rowid, part_number)
+            VALUES (new.id, new.part_number);
+        END;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS documents_pn_ad AFTER DELETE ON documents BEGIN
+            INSERT INTO documents_fts_pn(documents_fts_pn, rowid, part_number)
+            VALUES ('delete', old.id, old.part_number);
+        END;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS documents_pn_au AFTER UPDATE ON documents BEGIN
+            INSERT INTO documents_fts_pn(documents_fts_pn, rowid, part_number)
+            VALUES ('delete', old.id, old.part_number);
+            INSERT INTO documents_fts_pn(rowid, part_number)
+            VALUES (new.id, new.part_number);
+        END;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    if schema_version(pool).await? < PART_NUMBER_INDEX_SCHEMA_VERSION {
+        sqlx::query("INSERT INTO documents_fts_pn(documents_fts_pn) VALUES('rebuild');")
+            .execute(pool)
+            .await?;
+        set_schema_version(pool, PART_NUMBER_INDEX_SCHEMA_VERSION).await?;
+        info!("Populated part number trigram index from existing documents");
+    }
+
     Ok(())
 }
 
@@ -437,17 +493,45 @@ fn build_fts_query(raw: &str) -> Option<String> {
     Some(parts.join(" AND "))
 }
 
-/// Full-text search across document metadata.
-pub async fn search_documents(
-    pool: &SqlitePool,
-    query: &str,
-) -> Result<Vec<Document>, sqlx::Error> {
-    let Some(match_expression) = build_fts_query(query) else {
-        // Nothing searchable in the input. Returning an empty set keeps this
-        // consistent with a query that simply matches no documents.
-        return Ok(Vec::new());
-    };
+/// Builds an escaped `LIKE` pattern matching `raw` anywhere inside a value.
+///
+/// `LIKE` matches whole strings, so the pattern is wrapped in `%`. The
+/// metacharacters a user can type -- `%`, `_`, and the escape character itself --
+/// are escaped, so a query can never match more broadly than was typed. Without
+/// that, a bare `%` would match every row.
+///
+/// Returns `None` when the input holds no searchable character, which would
+/// otherwise become a bare `%` and match everything.
+fn build_part_number_pattern(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.chars().any(char::is_alphanumeric) {
+        return None;
+    }
 
+    let mut pattern = String::with_capacity(trimmed.len() + 4);
+    for character in trimmed.chars() {
+        match character {
+            '%' | '_' | '\\' => {
+                pattern.push('\\');
+                pattern.push(character);
+            }
+            other => pattern.push(other),
+        }
+    }
+    pattern.insert(0, '%');
+    pattern.push('%');
+    Some(pattern)
+}
+
+/// Finds documents whose part number contains `pattern` anywhere.
+///
+/// Answered from the trigram index, so the cost tracks the number of matches
+/// rather than the size of the table. Unlike the main search, a fragment from
+/// the middle of a part number matches here.
+async fn search_part_number(
+    pool: &SqlitePool,
+    pattern: &str,
+) -> Result<Vec<Document>, sqlx::Error> {
     let documents = sqlx::query_as::<_, Document>(
         r#"
         SELECT documents.id, documents.title, documents.part_number,
@@ -455,17 +539,70 @@ pub async fn search_documents(
                documents.document_version, documents.package_marking,
                documents.device_address, documents.notes, documents.storage_date,
                documents.original_file_name, documents.file_sha256, documents.file_path
-        FROM documents_fts
-        JOIN documents ON documents.id = documents_fts.rowid
-        WHERE documents_fts MATCH ?
-        ORDER BY bm25(documents_fts, 10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 2.0, 1.0),
-                 documents.title ASC
-        LIMIT 100
+        FROM documents_fts_pn
+        JOIN documents ON documents.id = documents_fts_pn.rowid
+        WHERE documents_fts_pn.part_number LIKE ? ESCAPE '\'
+        ORDER BY documents.part_number ASC
+        LIMIT ?
         "#,
     )
-    .bind(match_expression)
+    .bind(pattern)
+    .bind(SEARCH_RESULT_LIMIT)
     .fetch_all(pool)
     .await?;
+
+    Ok(documents)
+}
+
+/// Full-text search across document metadata.
+///
+/// Results come from the word-based index first, in relevance order, followed by
+/// any documents matched only by a part number fragment. Appending rather than
+/// merging keeps the relevance ordering intact while still surfacing partial
+/// part number matches, which the first query structurally cannot find.
+pub async fn search_documents(
+    pool: &SqlitePool,
+    query: &str,
+) -> Result<Vec<Document>, sqlx::Error> {
+    let mut documents = match build_fts_query(query) {
+        Some(match_expression) => {
+            sqlx::query_as::<_, Document>(
+                r#"
+                SELECT documents.id, documents.title, documents.part_number,
+                       documents.manufacturer, documents.document_id,
+                       documents.document_version, documents.package_marking,
+                       documents.device_address, documents.notes, documents.storage_date,
+                       documents.original_file_name, documents.file_sha256, documents.file_path
+                FROM documents_fts
+                JOIN documents ON documents.id = documents_fts.rowid
+                WHERE documents_fts MATCH ?
+                ORDER BY bm25(documents_fts, 10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 2.0, 1.0),
+                         documents.title ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(match_expression)
+            .bind(SEARCH_RESULT_LIMIT)
+            .fetch_all(pool)
+            .await?
+        }
+        // Nothing searchable in the input. The part number path below may still
+        // match, so this is not an early return.
+        None => Vec::new(),
+    };
+
+    if let Some(pattern) = build_part_number_pattern(query) {
+        let already_matched: HashSet<i64> = documents.iter().map(|document| document.id).collect();
+
+        for candidate in search_part_number(pool, &pattern).await? {
+            if documents.len() as i64 >= SEARCH_RESULT_LIMIT {
+                break;
+            }
+            if !already_matched.contains(&candidate.id) {
+                documents.push(candidate);
+            }
+        }
+    }
 
     Ok(documents)
 }
@@ -1093,11 +1230,15 @@ mod tests {
             .await
             .unwrap();
         // init_db runs every migration step, so the recorded version is the
-        // last one's. The FTS backfill is guarded by the lower of the two.
-        assert_eq!(version, UNUSED_COLUMNS_SCHEMA_VERSION);
-        // The column drop must record a higher version than the FTS step, since
-        // it runs second and its guard would otherwise skip the backfill.
-        const { assert!(UNUSED_COLUMNS_SCHEMA_VERSION > FTS_SCHEMA_VERSION) };
+        // last one's.
+        assert_eq!(version, PART_NUMBER_INDEX_SCHEMA_VERSION);
+        // Every step must record a higher version than the ones before it. If a
+        // later step claimed a lower one, an earlier guard would consider its
+        // work already done and skip a backfill.
+        const {
+            assert!(UNUSED_COLUMNS_SCHEMA_VERSION > FTS_SCHEMA_VERSION);
+            assert!(PART_NUMBER_INDEX_SCHEMA_VERSION > UNUSED_COLUMNS_SCHEMA_VERSION);
+        };
 
         // Re-running the migration on a populated index must not duplicate or
         // discard anything, which is what the version guard prevents.
@@ -1291,7 +1432,7 @@ mod tests {
         // must be a no-op rather than an error.
         let first = init_db(data_dir).await.unwrap();
         let version = schema_version(&first).await.unwrap();
-        assert_eq!(version, UNUSED_COLUMNS_SCHEMA_VERSION);
+        assert_eq!(version, PART_NUMBER_INDEX_SCHEMA_VERSION);
         first.close().await;
 
         let second = init_db(data_dir).await.unwrap();
@@ -1345,6 +1486,272 @@ mod tests {
             1
         );
         assert!(!column_exists(&migrated, "created_at").await.unwrap());
+    }
+
+    #[test]
+    fn test_build_part_number_pattern_matches_anywhere() {
+        // Wrapped in `%` because LIKE matches whole strings.
+        assert_eq!(build_part_number_pattern("550").as_deref(), Some("%550%"));
+        assert_eq!(
+            build_part_number_pattern("PN-5550").as_deref(),
+            Some("%PN-5550%")
+        );
+        assert_eq!(
+            build_part_number_pattern("  550  ").as_deref(),
+            Some("%550%")
+        );
+    }
+
+    #[test]
+    fn test_build_part_number_pattern_escapes_like_metacharacters() {
+        // A bare `%` would otherwise match every row.
+        assert_eq!(build_part_number_pattern("50%").as_deref(), Some("%50\\%%"));
+        assert_eq!(build_part_number_pattern("a_b").as_deref(), Some("%a\\_b%"));
+        assert_eq!(
+            build_part_number_pattern("a\\b").as_deref(),
+            Some("%a\\\\b%")
+        );
+
+        // Nothing searchable means no query, rather than a match-everything one.
+        assert_eq!(build_part_number_pattern("%"), None);
+        assert_eq!(build_part_number_pattern("  "), None);
+        assert_eq!(build_part_number_pattern(""), None);
+    }
+
+    #[tokio::test]
+    async fn test_search_matches_part_number_fragment_from_the_middle() {
+        let test_db = setup_test_db().await;
+
+        let mut document = doc("Unrelated title", "sha-pn-5550");
+        document.part_number = Some("PN-5550".to_string());
+        insert(&test_db.pool, document).await;
+
+        // The word-based index matches a part number only from its start, so
+        // this is what the trigram index is here to fix.
+        assert_eq!(
+            search_documents(&test_db.pool, "550").await.unwrap().len(),
+            1,
+            "a fragment from the middle of a part number should match"
+        );
+        let found = search_documents(&test_db.pool, "550").await.unwrap();
+        assert_eq!(found[0].part_number.as_deref(), Some("PN-5550"));
+
+        // Fragments at the start and end still work.
+        assert_eq!(
+            search_documents(&test_db.pool, "PN-55")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            search_documents(&test_db.pool, "550 rev")
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "a fragment that is not present should not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_number_search_does_not_duplicate_relevance_results() {
+        let test_db = setup_test_db().await;
+
+        // The title also contains the fragment, so the document is found by the
+        // word-based index first and must not appear twice.
+        let mut document = doc("Guide for 5550", "sha-pn-dupe");
+        document.part_number = Some("PN-5550".to_string());
+        insert(&test_db.pool, document).await;
+
+        let results = search_documents(&test_db.pool, "5550").await.unwrap();
+        let ids: Vec<i64> = results.iter().map(|d| d.id).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(ids, unique, "a document should appear only once");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_part_number_search_survives_edits_and_deletes() {
+        let test_db = setup_test_db().await;
+
+        let mut document = doc("Editable", "sha-pn-mutable");
+        document.part_number = Some("PN-1111".to_string());
+        insert(&test_db.pool, document).await;
+        assert_eq!(
+            search_documents(&test_db.pool, "1111").await.unwrap().len(),
+            1
+        );
+
+        // The trigger has to drop the old trigrams as well as add the new ones.
+        update_document_metadata(
+            &test_db.pool,
+            "sha-pn-mutable",
+            &DocumentMetadataUpdate {
+                title: "Editable",
+                part_number: Some("PN-2222"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            search_documents(&test_db.pool, "1111")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the old part number should no longer match"
+        );
+        assert_eq!(
+            search_documents(&test_db.pool, "2222").await.unwrap().len(),
+            1
+        );
+
+        let id = get_document_by_sha256(&test_db.pool, "sha-pn-mutable")
+            .await
+            .unwrap()
+            .expect("document should exist")
+            .id;
+        assert!(delete_document_by_id(&test_db.pool, id).await.unwrap());
+        assert!(
+            search_documents(&test_db.pool, "2222")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a deleted document should not still match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_number_search_does_not_widen_the_query() {
+        let test_db = setup_test_db().await;
+
+        for i in 0..3 {
+            let mut document = doc(&format!("Document {i}"), &format!("sha-pnw-{i}"));
+            document.part_number = Some(format!("PN-{i}000"));
+            insert(&test_db.pool, document).await;
+        }
+
+        // One part number that genuinely contains a `%`, so the escaped and
+        // unescaped readings of the same input give different answers.
+        let mut literal = doc("Literal", "sha-pnw-literal");
+        literal.part_number = Some("PN-50%X".to_string());
+        insert(&test_db.pool, literal).await;
+
+        // Unescaped, `%` would be a wildcard and this would return every
+        // document. Escaped, it matches only the one that really contains it.
+        let literal_matches = search_documents(&test_db.pool, "50%").await.unwrap();
+        assert_eq!(
+            literal_matches.len(),
+            1,
+            "a typed `%` must be literal, not a wildcard"
+        );
+        assert_eq!(literal_matches[0].part_number.as_deref(), Some("PN-50%X"));
+
+        // A bare `%` carries no searchable character, so no query is issued at
+        // all. This matches how the word-based path treats it, so the two
+        // paths cannot disagree about the same input.
+        assert!(
+            search_documents(&test_db.pool, "%")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a bare `%` must not match every row"
+        );
+
+        // `_` is escaped too, and no part number contains one.
+        assert!(
+            search_documents(&test_db.pool, "0_00")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a typed `_` must be literal, not a single-character wildcard"
+        );
+
+        // Ordinary fragments are unaffected.
+        assert_eq!(
+            search_documents(&test_db.pool, "000").await.unwrap().len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_number_index_is_backfilled_for_existing_documents() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+
+        // A database written before the trigram index existed: rows present, no
+        // trigram index, version marker not advanced.
+        let url = format!("sqlite:{}/carbon.db", data_dir);
+        Sqlite::create_database(&url).await.unwrap();
+        let pool = SqlitePool::connect(&url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL, part_number TEXT, manufacturer TEXT,
+                document_id TEXT, document_version TEXT, package_marking TEXT,
+                device_address TEXT, notes TEXT, storage_date TEXT NOT NULL,
+                original_file_name TEXT NOT NULL, file_sha256 TEXT NOT NULL UNIQUE,
+                file_path TEXT NOT NULL
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (title, part_number, storage_date, original_file_name, file_sha256, file_path)
+             VALUES ('Legacy Part', 'PN-7788', '2024-01-01', 'l.pdf', 'pn-legacy', '/tmp/l.pdf')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let migrated = init_db(data_dir).await.unwrap();
+
+        // Only the trigram index can find a mid-part-number fragment.
+        let found = search_documents(&migrated, "788").await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "the trigram index should have been backfilled"
+        );
+        assert_eq!(found[0].part_number.as_deref(), Some("PN-7788"));
+        assert_eq!(
+            schema_version(&migrated).await.unwrap(),
+            PART_NUMBER_INDEX_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_number_query_uses_the_trigram_index() {
+        let test_db = setup_test_db().await;
+
+        let rows = sqlx::query(
+            "EXPLAIN QUERY PLAN \
+             SELECT documents.id FROM documents_fts_pn \
+             JOIN documents ON documents.id = documents_fts_pn.rowid \
+             WHERE documents_fts_pn.part_number LIKE ? ESCAPE '\\'",
+        )
+        .bind(build_part_number_pattern("7788").unwrap())
+        .fetch_all(&test_db.pool)
+        .await
+        .unwrap();
+        let plan: String = rows
+            .iter()
+            .map(|row| sqlx::Row::try_get::<String, _>(row, "detail").unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        // A leading `%` would force a scan of the documents table. The
+        // trigram index is what keeps the cost proportional to the matches.
+        assert!(
+            plan.contains("VIRTUAL TABLE INDEX"),
+            "the part number lookup should be answered by the trigram index, got: {plan}"
+        );
     }
 
     #[tokio::test]
