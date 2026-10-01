@@ -141,6 +141,7 @@ pub fn create_api_routes() -> Router<AppState> {
         .route("/auth", post(handle_auth))
         .route("/auth/status", get(handle_auth_status))
         .route("/search", get(handle_search))
+        .route("/documents", get(handle_list))
         .route("/submit", post(handle_submit))
         .route("/document/{sha256}", get(handle_get_document))
         .route("/document/{sha256}", put(handle_update_document))
@@ -273,6 +274,78 @@ pub async fn handle_search(
         }
         Err(e) => {
             error!("Database search error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Query parameters for the paginated document listing.
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub page: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListResponse {
+    pub results: Vec<SearchResult>,
+    pub page: i64,
+    pub per_page: i64,
+    pub total: i64,
+    pub total_pages: i64,
+    pub has_previous: bool,
+    pub has_next: bool,
+    duration_ms: u128,
+}
+
+pub async fn handle_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<ListResponse>, StatusCode> {
+    let start_time = Instant::now();
+
+    // An absent or nonsensical `page` starts at the first page; out-of-range
+    // pages are clamped inside `get_documents_page`.
+    let page = match query.page {
+        Some(requested) if requested > 0 => requested,
+        _ => 1,
+    };
+
+    match database::get_documents_page(&state.database, page, database::PAGE_SIZE).await {
+        Ok(page_data) => {
+            let duration = start_time.elapsed().as_millis();
+            let total_pages = page_data.total_pages();
+            let (page_number, per_page, total, has_previous, has_next) = (
+                page_data.page,
+                page_data.per_page,
+                page_data.total,
+                page_data.has_previous(),
+                page_data.has_next(),
+            );
+            let result_count = page_data.documents.len();
+
+            info!(
+                "Listed page {} of {} ({} documents) in {}ms",
+                page_number, total_pages, result_count, duration
+            );
+
+            Ok(Json(ListResponse {
+                results: page_data
+                    .documents
+                    .into_iter()
+                    .map(SearchResult::from)
+                    .collect(),
+                page: page_number,
+                per_page,
+                total,
+                total_pages,
+                has_previous,
+                has_next,
+                duration_ms: duration,
+            }))
+        }
+        Err(e) => {
+            error!("Database error listing documents: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

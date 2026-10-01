@@ -36,6 +36,7 @@ pub fn App() -> impl IntoView {
                 <Routes transition=true fallback=|| "This page could not be found.">
 
                     <Route path=path!("/") view=HomePage/>
+                    <Route path=path!("/all") view=AllFilesPage/>
                     <Route path=path!("/login") view=LoginPage/>
                     <Route path=path!("/submit") view=SubmitPage/>
                     <Route path=path!("/edit/:sha256") view=EditPage/>
