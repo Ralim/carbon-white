@@ -1,3 +1,7 @@
+// Signal setters are only ever mutated from `hydrate`-gated effects and event
+// handlers, so they read as unused in an SSR-only build.
+#![cfg_attr(not(feature = "hydrate"), allow(unused_variables))]
+
 use crate::{components::header::Header, pages::footer::Footer};
 use leptos::prelude::*;
 use leptos_router::*;
@@ -68,6 +72,9 @@ pub fn LoginPage() -> impl IntoView {
         let navigate = navigate.clone();
         move |_| {
             let auth_key_value = auth_key.get();
+
+            // The setters are `Copy`, but re-binding them locally keeps this
+            // closure `FnMut` instead of consuming the captured signals.
             let set_is_logging_in = set_is_logging_in;
             let set_error_message = set_error_message;
             let set_success_message = set_success_message;
