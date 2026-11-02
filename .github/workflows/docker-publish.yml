@@ -147,6 +147,100 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # Built into the local daemon first so it can be smoke tested before
+      # anything is pushed. The push below reuses these layers from the cache.
+      - name: Build image for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: carbon-white:smoke-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Starts the image, exercises the pages and API, and fails if the server
+      # does not come up, panics, or does not shut down cleanly on SIGTERM.
+      - name: Smoke test image
+        shell: bash
+        env:
+          IMAGE: carbon-white:smoke-test
+        run: |
+          set -euo pipefail
+
+          container=carbon-white-smoke-test
+          base=http://127.0.0.1:8080
+
+          docker run --detach --name "$container" \
+            --publish 127.0.0.1:8080:8080 \
+            --env CARBON_AUTH_KEY=ci-smoke-test-key \
+            "$IMAGE" >/dev/null
+
+          # Logs are printed and the container removed whatever the outcome.
+          cleanup() {
+            echo "::group::Container logs"
+            docker logs "$container" 2>&1 || true
+            echo "::endgroup::"
+            docker rm --force "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          for _ in $(seq 1 30); do
+            if curl --silent --fail --output /dev/null "$base/"; then
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' "$container")" = true ] \
+              || fail "Container exited during startup"
+            sleep 1
+          done
+          curl --silent --fail --output /dev/null "$base/" \
+            || fail "Server did not answer within 30 seconds"
+
+          expect() {
+            local method=$1 path=$2 expected=$3 status
+            shift 3
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --request "$method" "$@" "$base$path")
+            [ "$status" = "$expected" ] \
+              || fail "$method $path returned $status, expected $expected"
+          }
+
+          expect GET / 200
+          expect GET /all 200
+          expect GET /pkg/carbon-white.css 200
+          expect GET /favicon.ico 200
+          expect GET "/api/search?q=" 200
+          expect GET "/api/search?q=datasheet" 200
+          expect GET /api/documents 200
+          expect GET /api/auth/status 200
+          expect GET /file/not-a-hash 400
+          expect GET "/file/$(printf '0%.0s' $(seq 64))" 404
+          expect POST /api/auth 200 \
+            --header 'content-type: application/json' --data '{"auth_key":"wrong"}'
+
+          logs=$(docker logs "$container" 2>&1)
+          grep -q "listening on" <<<"$logs" || fail "Server never reported that it was listening"
+          if grep -q "panicked" <<<"$logs"; then
+            fail "Server panicked"
+          fi
+          [ "$(docker inspect --format '{{.State.Running}}' "$container")" = true ] \
+            || fail "Container exited while serving requests"
+
+          # SIGTERM must drain and exit cleanly rather than time out into SIGKILL.
+          docker stop --time 10 "$container" >/dev/null
+          exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container")
+          [ "$exit_code" = 0 ] || fail "Server exited with status $exit_code on SIGTERM"
+          logs=$(docker logs "$container" 2>&1)
+          if grep -q "panicked" <<<"$logs"; then
+            fail "Server panicked during shutdown"
+          fi
+
       - name: Log in to the Container registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
