@@ -53,9 +53,13 @@ async fn main() {
         .expect("Failed to initialize database");
 
     // Create app state
+    let whitelist = parse_subnet_list(&carbon_whitelist_ips);
+    if whitelist.is_empty() {
+        warn!("CARBON_WHITELIST_IPS has no valid entries, so only loopback clients may log in");
+    }
     let app_state = AppState::new(database, carbon_data_dir, carbon_auth_key)
-        .with_whitelist(parse_ip_whitelist(&carbon_whitelist_ips))
-        .with_trusted_proxies(parse_ip_whitelist(&carbon_trusted_proxies));
+        .with_whitelist(whitelist)
+        .with_trusted_proxies(parse_subnet_list(&carbon_trusted_proxies));
 
     // Setting get_configuration(None) means we'll be using cargo-leptos's env values
     let conf = get_configuration(None).unwrap();
@@ -177,16 +181,22 @@ async fn serve_favicon_at(
     }
 }
 
-/// Parses a comma-separated whitelist of IPs or CIDR ranges.
+/// Parses a comma-separated list of IPs or CIDR ranges.
+///
+/// Invalid entries are skipped with a warning rather than failing startup, so
+/// a typo is visible in the log instead of silently narrowing the list.
 #[cfg(feature = "ssr")]
-fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
-    if whitelist.is_empty() {
-        return Vec::new();
-    }
-
-    whitelist
-        .split(',')
-        .filter_map(|ip| ip.trim().try_into().ok())
+fn parse_subnet_list(list: &str) -> Vec<IPSubnet> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| match IPSubnet::try_from(entry) {
+            Ok(subnet) => Some(subnet),
+            Err(e) => {
+                tracing::warn!("Ignoring invalid address or subnet `{}`: {}", entry, e);
+                None
+            }
+        })
         .collect()
 }
 
@@ -201,21 +211,21 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_parse_ip_whitelist_empty() {
-        let result = parse_ip_whitelist("");
+    fn test_parse_subnet_list_empty() {
+        let result = parse_subnet_list("");
         assert!(result.is_empty());
     }
 
     #[test]
-    fn test_parse_ip_whitelist_single_ip() {
-        let result = parse_ip_whitelist("127.0.0.1");
+    fn test_parse_subnet_list_single_ip() {
+        let result = parse_subnet_list("127.0.0.1");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].to_string(), "127.0.0.1");
     }
 
     #[test]
-    fn test_parse_ip_whitelist_multiple_ips() {
-        let result = parse_ip_whitelist("127.0.0.1,192.168.1.1,::1");
+    fn test_parse_subnet_list_multiple_ips() {
+        let result = parse_subnet_list("127.0.0.1,192.168.1.1,::1");
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].to_string(), "127.0.0.1");
         assert_eq!(result[1].to_string(), "192.168.1.1");
@@ -223,19 +233,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ip_whitelist_with_spaces() {
-        let result = parse_ip_whitelist(" 127.0.0.1 , 192.168.1.1 ");
+    fn test_parse_subnet_list_with_spaces() {
+        let result = parse_subnet_list(" 127.0.0.1 , 192.168.1.1 ");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].to_string(), "127.0.0.1");
         assert_eq!(result[1].to_string(), "192.168.1.1");
     }
 
     #[test]
-    fn test_parse_ip_whitelist_invalid_ips() {
-        let result = parse_ip_whitelist("127.0.0.1,invalid,192.168.1.1");
+    fn test_parse_subnet_list_invalid_ips() {
+        let result = parse_subnet_list("127.0.0.1,invalid,192.168.1.1");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].to_string(), "127.0.0.1");
         assert_eq!(result[1].to_string(), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_parse_subnet_list_skips_blank_entries_and_bad_prefixes() {
+        let result = parse_subnet_list("10.0.0.0/8, ,192.168.0.0/33,");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "10.0.0.0/8");
+
+        assert!(parse_subnet_list(" , ").is_empty());
     }
 
     #[tokio::test]
@@ -251,7 +270,7 @@ mod tests {
             .expect("Failed to initialize test database");
 
         let app_state = AppState::new(database, temp_path.clone(), "test_auth_key")
-            .with_whitelist(parse_ip_whitelist("127.0.0.1"));
+            .with_whitelist(parse_subnet_list("127.0.0.1"));
 
         assert_eq!(app_state.data_dir, temp_path);
         assert_eq!(app_state.auth_key, "test_auth_key");
@@ -282,7 +301,7 @@ mod tests {
             .expect("Failed to initialize test database");
 
         let app_state = AppState::new(database, temp_path, "test_auth_key")
-            .with_whitelist(parse_ip_whitelist("127.0.0.1"));
+            .with_whitelist(parse_subnet_list("127.0.0.1"));
 
         // Test that we can create API routes
         let _api_routes = api::create_api_routes();
@@ -543,7 +562,7 @@ mod tests {
             temp_path,
             "test_auth_key_123",
         )
-        .with_whitelist(parse_ip_whitelist("192.168.0.0/24"));
+        .with_whitelist(parse_subnet_list("192.168.0.0/24"));
         let router = api::create_api_routes().with_state(state);
         let attacker = SocketAddr::from(([192, 168, 0, 66], 40000));
 
@@ -601,8 +620,8 @@ mod tests {
             temp_path,
             "test_auth_key_123",
         )
-        .with_whitelist(parse_ip_whitelist("192.168.0.0/24"))
-        .with_trusted_proxies(parse_ip_whitelist("10.0.0.1"));
+        .with_whitelist(parse_subnet_list("192.168.0.0/24"))
+        .with_trusted_proxies(parse_subnet_list("10.0.0.1"));
         let router = api::create_api_routes().with_state(state);
         let proxy = SocketAddr::from(([10, 0, 0, 1], 40000));
 

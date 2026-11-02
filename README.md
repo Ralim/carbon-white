@@ -98,7 +98,7 @@ RECENT_FILE_COUNT=10
 
 - `CARBON_DATA_DIR`: Directory where files and database will be stored (defaults to `/tmp/carbon/`)
 - `CARBON_AUTH_KEY`: Secret key for authentication (required for production)
-- `CARBON_WHITELIST_IPS`: Comma-separated list of allowed IP addresses (empty = localhost only) for login
+- `CARBON_WHITELIST_IPS`: Comma-separated list of IP addresses or subnets allowed to log in. Defaults to `127.0.0.1,::1`; if it is empty or holds no valid entries, only loopback clients may log in. Invalid entries are logged and skipped
 - `CARBON_TRUSTED_PROXIES`: Comma-separated list of reverse proxy addresses or subnets. `X-Forwarded-For` / `X-Real-IP` are only honoured on connections from these peers (empty = headers ignored, the socket address is used)
 - `RECENT_FILE_COUNT`: Number of recent files to show on the homepage (default 10)
 

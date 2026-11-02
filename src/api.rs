@@ -581,7 +581,7 @@ pub async fn handle_submit(
                     return Ok(Json(SubmitResponse {
                         success: false,
                         message: format!(
-                            "File size exceeds {}MB limit",
+                            "File size exceeds {} MiB limit",
                             crate::MAX_UPLOAD_SIZE / (1024 * 1024)
                         ),
                         file_sha256: None,
@@ -1176,12 +1176,12 @@ mod tests {
     fn test_submit_response_file_too_large() {
         let response = SubmitResponse {
             success: false,
-            message: "File size exceeds 100MB limit".to_string(),
+            message: "File size exceeds 250 MiB limit".to_string(),
             file_sha256: None,
         };
 
         assert!(!response.success);
-        assert_eq!(response.message, "File size exceeds 100MB limit");
+        assert_eq!(response.message, "File size exceeds 250 MiB limit");
         assert!(response.file_sha256.is_none());
     }
 
