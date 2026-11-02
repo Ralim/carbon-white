@@ -67,17 +67,25 @@ pub async fn serve_file(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut response = ServeFile::new(&document.file_path)
+    let Some(file_path) = database::resolve_file_path(&state.data_dir, &document.file_path) else {
+        error!(
+            "Refusing to serve document {} from unsafe path `{}`",
+            sha256, document.file_path
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    let mut response = ServeFile::new(&file_path)
         .oneshot(request)
         .await
         .map_err(|e| {
-            error!("Failed to serve file {}: {}", document.file_path, e);
+            error!("Failed to serve file {}: {}", file_path.display(), e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Missing file
     if response.status() == StatusCode::NOT_FOUND {
-        error!("File not found on disk: {}", document.file_path);
+        error!("File not found on disk: {}", file_path.display());
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -110,7 +118,8 @@ pub async fn serve_file(
 
     info!(
         "Serving file: {} ({})",
-        document.original_file_name, document.file_path
+        document.original_file_name,
+        file_path.display()
     );
 
     Ok(response.map(Body::new))
@@ -345,7 +354,7 @@ mod tests {
                 storage_date: "2024-01-01".to_string(),
                 original_file_name: name.to_string(),
                 file_sha256: sha.clone(),
-                file_path: file_path.to_string_lossy().to_string(),
+                file_path: format!("files/{sha}/{name}"),
             },
         )
         .await
@@ -354,6 +363,52 @@ mod tests {
 
         let state = AppState::new(pool, data_dir, "test-key");
         (create_file_routes().with_state(state), sha, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_refuses_paths_outside_data_dir() {
+        use axum::http::Request;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(temp_dir.path().join("outside.txt"), b"secret").unwrap();
+        let data_dir = data_dir.to_str().unwrap().to_string();
+        let pool = crate::database::init_db(&data_dir).await.unwrap();
+
+        let sha = "d".repeat(64);
+        crate::database::insert_document_if_absent(
+            &pool,
+            crate::database::NewDocument {
+                title: "Escape".to_string(),
+                part_number: None,
+                manufacturer: None,
+                document_id: None,
+                document_version: None,
+                package_marking: None,
+                device_address: None,
+                notes: None,
+                storage_date: "2024-01-01".to_string(),
+                original_file_name: "outside.txt".to_string(),
+                file_sha256: sha.clone(),
+                file_path: "../outside.txt".to_string(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let router = create_file_routes().with_state(AppState::new(pool, data_dir, "test-key"));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -496,7 +551,7 @@ mod tests {
                 storage_date: "2024-01-01".to_string(),
                 original_file_name: "datasheet.pdf".to_string(),
                 file_sha256: sha.clone(),
-                file_path: file_path.to_string_lossy().to_string(),
+                file_path: format!("files/{sha}/datasheet.pdf"),
             },
         )
         .await

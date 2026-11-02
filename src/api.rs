@@ -636,9 +636,13 @@ pub async fn handle_submit(
 
     // The uploaded name is attacker controlled, so only ever use the sanitized
     // basename for the on-disk path. The raw name is kept in the database for
-    // display only.
+    // display only. The database holds the path relative to the data directory.
+    let stored_path = format!(
+        "files/{file_hash}/{}",
+        sanitize_upload_filename(&original_filename)
+    );
+    let file_path = Path::new(&state.data_dir).join(&stored_path);
     let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
-    let file_path = file_dir.join(sanitize_upload_filename(&original_filename));
 
     // The row is inserted before the file is moved. The unique hash makes the
     // insert the arbiter between concurrent uploads of the same bytes: only the
@@ -659,7 +663,7 @@ pub async fn handle_submit(
         storage_date,
         original_file_name: original_filename,
         file_sha256: file_hash.clone(),
-        file_path: file_path.to_string_lossy().to_string(),
+        file_path: stored_path,
     };
 
     let id = match database::insert_document_if_absent(&state.database, new_document).await {

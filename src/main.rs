@@ -996,6 +996,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_stores_path_relative_to_data_dir() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"relative";
+        let response = post_submit(router, &state, multipart_body("Rel", "r.pdf", content)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hash = hex::encode(Sha256::digest(content));
+        let stored = database::get_document_by_sha256(&state.database, &hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.file_path, format!("files/{hash}/r.pdf"));
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&state.data_dir).join(&stored.file_path)).unwrap(),
+            content
+        );
+    }
+
+    #[tokio::test]
     async fn test_malformed_upload_leaves_no_staged_file() {
         use axum::http::StatusCode;
 

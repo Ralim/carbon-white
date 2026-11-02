@@ -1,6 +1,6 @@
 use sqlx::{FromRow, Row, Sqlite, SqlitePool, migrate::MigrateDatabase, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
 pub async fn init_db(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -59,6 +59,7 @@ pub async fn init_db(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
     drop_unused_columns(&pool).await?;
     create_part_number_index(&pool).await?;
     normalize_blank_fields(&pool).await?;
+    make_file_paths_relative(&pool, Path::new(data_dir)).await?;
 
     let version = schema_version(&pool).await?;
     if version < LATEST_SCHEMA_VERSION {
@@ -137,8 +138,12 @@ const PART_NUMBER_INDEX_SCHEMA_VERSION: i64 = 3;
 /// and surrounding whitespace has been trimmed.
 const BLANK_FIELDS_SCHEMA_VERSION: i64 = 4;
 
+/// `user_version` value recorded once `file_path` is stored relative to the
+/// data directory rather than as an absolute path.
+const RELATIVE_PATHS_SCHEMA_VERSION: i64 = 5;
+
 /// The version `init_db` leaves a database at.
-const LATEST_SCHEMA_VERSION: i64 = BLANK_FIELDS_SCHEMA_VERSION;
+const LATEST_SCHEMA_VERSION: i64 = RELATIVE_PATHS_SCHEMA_VERSION;
 
 /// Rows a single search returns at most.
 const SEARCH_RESULT_LIMIT: i64 = 100;
@@ -239,6 +244,126 @@ async fn normalize_blank_fields(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     info!(
         "Normalised blank metadata on {} document(s)",
         result.rows_affected()
+    );
+    Ok(())
+}
+
+/// Renders `path` with `/` separators if it consists only of plain names.
+///
+/// Returns `None` for anything containing a root, a prefix, `.` or `..`, so a
+/// stored path can never climb out of the data directory.
+fn to_relative_string(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Turns a `file_path` written before schema version 5 into one relative to
+/// `data_dir`.
+///
+/// Paths under `data_dir` have that prefix removed. Otherwise the data
+/// directory has moved since the row was written, so the `files/<sha>/<name>`
+/// tail of the upload layout is recognised instead. Returns `None` when neither
+/// applies.
+fn relativize_file_path(data_dir: &Path, sha256: &str, stored: &str) -> Option<String> {
+    let stored = Path::new(stored);
+    if let Ok(rest) = stored.strip_prefix(data_dir)
+        && let Some(relative) = to_relative_string(rest)
+    {
+        return Some(relative);
+    }
+
+    let components: Vec<Component> = stored.components().collect();
+    match components.as_slice() {
+        [
+            ..,
+            Component::Normal(files),
+            Component::Normal(hash),
+            Component::Normal(name),
+        ] if files.to_str() == Some("files") && hash.to_str() == Some(sha256) => {
+            to_relative_string(&Path::new("files").join(hash).join(name))
+        }
+        _ => None,
+    }
+}
+
+/// Upload-layout path `files/<sha>/<name>` for a row whose stored path
+/// `relativize_file_path` could not place, keeping the stored file name.
+///
+/// Returns `None` when the stored path has no file name to keep.
+fn canonical_file_path(sha256: &str, stored: &str) -> Option<String> {
+    let name = Path::new(stored).file_name()?;
+    to_relative_string(&Path::new("files").join(sha256).join(name))
+}
+
+/// Resolves a stored `file_path` to a location on disk.
+///
+/// The path is joined onto `data_dir` and must consist of plain names only, so
+/// absolute paths and anything containing `.` or `..` yield `None`.
+pub fn resolve_file_path(data_dir: &str, stored: &str) -> Option<PathBuf> {
+    to_relative_string(Path::new(stored)).map(|relative| Path::new(data_dir).join(relative))
+}
+
+/// Rewrites every `file_path` relative to the data directory, so the directory
+/// can be moved or mounted elsewhere without breaking stored documents.
+///
+/// Rows outside the upload layout are pointed at `files/<sha>/<name>` and
+/// logged, as their file has to be moved there by hand. A row with no file name
+/// fails the migration, since it cannot be stored relatively.
+async fn make_file_paths_relative(pool: &SqlitePool, data_dir: &Path) -> Result<(), sqlx::Error> {
+    if schema_version(pool).await? >= RELATIVE_PATHS_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let rows: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, file_sha256, file_path FROM documents")
+            .fetch_all(pool)
+            .await?;
+
+    let mut converted = 0usize;
+    let mut transaction = pool.begin().await?;
+    for (id, sha256, stored) in rows {
+        let relative = match relativize_file_path(data_dir, &sha256, &stored) {
+            Some(relative) => relative,
+            None => {
+                let relative = canonical_file_path(&sha256, &stored).ok_or_else(|| {
+                    sqlx::Error::Configuration(
+                        format!(
+                            "document {id} has file path `{stored}`, which cannot be stored relative to the data directory"
+                        )
+                        .into(),
+                    )
+                })?;
+                warn!(
+                    "Document {} was stored outside the data directory at `{}`; move the file to `{}`",
+                    id,
+                    stored,
+                    data_dir.join(&relative).display()
+                );
+                relative
+            }
+        };
+        if relative == stored {
+            continue;
+        }
+        sqlx::query("UPDATE documents SET file_path = ? WHERE id = ?")
+            .bind(&relative)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        converted += 1;
+    }
+    transaction.commit().await?;
+
+    set_schema_version(pool, RELATIVE_PATHS_SCHEMA_VERSION).await?;
+    info!(
+        "Stored {} file path(s) relative to the data directory",
+        converted
     );
     Ok(())
 }
@@ -1308,7 +1433,8 @@ mod tests {
             assert!(UNUSED_COLUMNS_SCHEMA_VERSION > FTS_SCHEMA_VERSION);
             assert!(PART_NUMBER_INDEX_SCHEMA_VERSION > UNUSED_COLUMNS_SCHEMA_VERSION);
             assert!(BLANK_FIELDS_SCHEMA_VERSION > PART_NUMBER_INDEX_SCHEMA_VERSION);
-            assert!(LATEST_SCHEMA_VERSION >= BLANK_FIELDS_SCHEMA_VERSION);
+            assert!(RELATIVE_PATHS_SCHEMA_VERSION > BLANK_FIELDS_SCHEMA_VERSION);
+            assert!(LATEST_SCHEMA_VERSION >= RELATIVE_PATHS_SCHEMA_VERSION);
         };
 
         // Re-running the migration on a populated index must not duplicate or
@@ -1831,6 +1957,129 @@ mod tests {
         assert_eq!(found.len(), 1);
         let found = search_documents(&test_db.pool, "keep").await.unwrap();
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn test_relativize_file_path_strips_data_dir() {
+        let sha = "a".repeat(64);
+        let stored = format!("/srv/carbon/files/{sha}/datasheet.pdf");
+        assert_eq!(
+            relativize_file_path(Path::new("/srv/carbon/"), &sha, &stored),
+            Some(format!("files/{sha}/datasheet.pdf"))
+        );
+
+        // A relative data directory produced cwd-relative paths.
+        assert_eq!(
+            relativize_file_path(
+                Path::new("./data"),
+                &sha,
+                &format!("data/files/{sha}/x.pdf")
+            ),
+            Some(format!("files/{sha}/x.pdf"))
+        );
+    }
+
+    #[test]
+    fn test_relativize_file_path_recovers_moved_data_dir() {
+        let sha = "b".repeat(64);
+        let stored = format!("/old/location/files/{sha}/notes.txt");
+        assert_eq!(
+            relativize_file_path(Path::new("/new/location"), &sha, &stored),
+            Some(format!("files/{sha}/notes.txt"))
+        );
+
+        // The hash in the path must belong to the row.
+        let other = "c".repeat(64);
+        assert_eq!(
+            relativize_file_path(Path::new("/new/location"), &other, &stored),
+            None
+        );
+        assert_eq!(
+            relativize_file_path(Path::new("/new/location"), &sha, "/somewhere/else.pdf"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_canonical_file_path() {
+        let sha = "e".repeat(64);
+        assert_eq!(
+            canonical_file_path(&sha, "/mnt/elsewhere/c.pdf"),
+            Some(format!("files/{sha}/c.pdf"))
+        );
+        assert_eq!(canonical_file_path(&sha, "/"), None);
+        assert_eq!(canonical_file_path(&sha, "/mnt/.."), None);
+        assert_eq!(canonical_file_path("../escape", "/mnt/c.pdf"), None);
+    }
+
+    #[test]
+    fn test_resolve_file_path() {
+        assert_eq!(
+            resolve_file_path("/data", "files/abc/x.pdf"),
+            Some(PathBuf::from("/data/files/abc/x.pdf"))
+        );
+        // Every row is relative after the version 5 migration.
+        assert_eq!(resolve_file_path("/data", "/legacy/x.pdf"), None);
+        // A relative path may not escape the data directory.
+        assert_eq!(resolve_file_path("/data", "../etc/passwd"), None);
+        assert_eq!(resolve_file_path("/data", "files/../../etc/passwd"), None);
+        assert_eq!(resolve_file_path("/data", ""), None);
+    }
+
+    #[tokio::test]
+    async fn test_migration_makes_file_paths_relative() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let pool = init_db(data_dir).await.unwrap();
+
+        let under = "1".repeat(64);
+        let moved = "2".repeat(64);
+        let foreign = "3".repeat(64);
+        let mut rows = vec![
+            doc("Under data dir", &under),
+            doc("Moved data dir", &moved),
+            doc("Foreign path", &foreign),
+        ];
+        rows[0].file_path = format!("{data_dir}/files/{under}/a.pdf");
+        rows[1].file_path = format!("/previous/home/files/{moved}/b.pdf");
+        rows[2].file_path = "/mnt/elsewhere/c.pdf".to_string();
+        for row in rows {
+            insert(&pool, row).await;
+        }
+
+        // Roll the marker back to before the migration existed and reopen.
+        set_schema_version(&pool, BLANK_FIELDS_SCHEMA_VERSION)
+            .await
+            .unwrap();
+        pool.close().await;
+        let pool = init_db(data_dir).await.unwrap();
+        assert_eq!(
+            schema_version(&pool).await.unwrap(),
+            RELATIVE_PATHS_SCHEMA_VERSION
+        );
+
+        let path_of = |sha: String| {
+            let pool = pool.clone();
+            async move {
+                get_document_by_sha256(&pool, &sha)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .file_path
+            }
+        };
+        assert_eq!(path_of(under.clone()).await, format!("files/{under}/a.pdf"));
+        assert_eq!(path_of(moved.clone()).await, format!("files/{moved}/b.pdf"));
+        assert_eq!(
+            path_of(foreign.clone()).await,
+            format!("files/{foreign}/c.pdf")
+        );
+
+        // Converted rows resolve back under the current data directory.
+        assert_eq!(
+            resolve_file_path(data_dir, &format!("files/{under}/a.pdf")),
+            Some(Path::new(data_dir).join(format!("files/{under}/a.pdf")))
+        );
     }
 
     #[tokio::test]
