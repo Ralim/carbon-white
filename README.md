@@ -74,13 +74,16 @@ This repo is published to `ghcr.io/ralim/carbon-white:main`
 You can run it with:
 
 ```sh
-docker run -d -p 8080:8080 \
-  -e CARBON_DATA_DIR=/data \  # Directory inside the container to store files
-  -e CARBON_AUTH_KEY=your-secret-auth-key \  # Set your auth key
-  --volume /path/to/local/data:/data \  # Map local data directory
+podman run -d -p 8080:8080 \
+  -e CARBON_AUTH_KEY=your-secret-auth-key \
+  --userns=keep-id:uid=10001,gid=10001 \
+  --volume /path/to/local/data:/data:Z \
   --name carbon-white \
   ghcr.io/ralim/carbon-white:main
 ```
+
+- `CARBON_DATA_DIR` defaults to `/data` inside the image; mount your data directory there.
+- The server runs as the unprivileged user `10001:10001`, so the mounted directory must be writable by that ID. With rootless podman, `--userns=keep-id:uid=10001,gid=10001` maps it to your own user. Otherwise run `chown -R 10001:10001 /path/to/local/data` once (images before this change ran as root, so existing data directories need this).
 
 ### Locally
 

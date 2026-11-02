@@ -1,40 +1,30 @@
-FROM rust:1-trixie AS builder
+FROM docker.io/library/rust:1-trixie AS builder
 
-# Install cargo-binstall based on architecture
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "amd64" ]; then \
-    curl -L https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | tar -xz -C /usr/local/cargo/bin; \
-    elif [ "$ARCH" = "arm64" ]; then \
-    curl -L https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-aarch64-unknown-linux-musl.tgz | tar -xz -C /usr/local/cargo/bin; \
-    else \
-    echo "Unsupported architecture: $ARCH" && exit 1; \
-    fi
+# Built from crates.io at a pinned version against its own lockfile, rather than
+# piping an unverified "latest" release binary into the image.
+ARG CARGO_LEPTOS_VERSION=0.3.11
+RUN cargo install cargo-leptos --version "${CARGO_LEPTOS_VERSION}" --locked \
+  && rustup target add wasm32-unknown-unknown
 
-# Install required tools
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends clang
-
-# Install cargo-leptos using cargo-binstall
-RUN cargo binstall cargo-leptos --no-confirm
-
-# Add the WASM target
-RUN rustup target add wasm32-unknown-unknown
-
-# Make an /app dir, which everything will eventually live in
-RUN mkdir -p /app
 WORKDIR /app
 COPY . .
 
 # Build the app
 RUN cargo leptos build --release
 
-FROM debian:trixie-slim AS runtime
+FROM docker.io/library/debian:trixie-slim AS runtime
+
+# Unprivileged 10001:10001 account that owns the data volume. The group is
+# created explicitly so its GID does not rely on useradd's defaults.
+# SQLite is compiled into the binary and the server makes no outbound TLS
+# connections, so no extra runtime packages are needed.
+RUN groupadd --gid 10001 carbon \
+  && useradd --uid 10001 --gid 10001 --no-create-home \
+  --home-dir /app --shell /usr/sbin/nologin carbon \
+  && mkdir -p /data \
+  && chown carbon:carbon /data
+
 WORKDIR /app
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends openssl ca-certificates \
-    && apt-get autoremove -y \
-    && apt-get clean -y \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy the server binary to the /app directory
 COPY --from=builder /app/target/release/carbon-white /app/
@@ -42,11 +32,13 @@ COPY --from=builder /app/target/release/carbon-white /app/
 # /target/site contains our JS/WASM/CSS, etc.
 COPY --from=builder /app/target/site /app/site
 
-# Setup env
-ENV RUST_LOG="info"
-ENV LEPTOS_SITE_ADDR="0.0.0.0:8080"
-ENV LEPTOS_SITE_ROOT="site"
+ENV RUST_LOG="info" \
+  LEPTOS_SITE_ADDR="0.0.0.0:8080" \
+  LEPTOS_SITE_ROOT="site" \
+  CARBON_DATA_DIR="/data"
+
+VOLUME ["/data"]
+USER carbon
 EXPOSE 8080
 
-# Run the server
 CMD ["/app/carbon-white"]
