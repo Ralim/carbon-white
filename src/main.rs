@@ -81,21 +81,22 @@ async fn main() {
         .with_state(app_state);
 
     // Create static routes (must come before leptos routes to avoid fallback catching them)
+    let favicon = {
+        let site_root = leptos_options.site_root.clone();
+        axum::routing::get(move |request: axum::extract::Request| {
+            let site_root = site_root.clone();
+            async move { serve_favicon_at(request, &site_root).await }
+        })
+    };
     let static_routes = Router::new()
         .nest_service("/pkg", pkg_service)
-        .route("/favicon.ico", axum::routing::get(serve_favicon))
-        .route("/favicon-16x16.png", axum::routing::get(serve_favicon))
-        .route("/favicon-32x32.png", axum::routing::get(serve_favicon))
-        .route("/apple-touch-icon.png", axum::routing::get(serve_favicon))
-        .route("/site.webmanifest", axum::routing::get(serve_favicon))
-        .route(
-            "/android-chrome-192x192.png",
-            axum::routing::get(serve_favicon),
-        )
-        .route(
-            "/android-chrome-512x512.png",
-            axum::routing::get(serve_favicon),
-        );
+        .route("/favicon.ico", favicon.clone())
+        .route("/favicon-16x16.png", favicon.clone())
+        .route("/favicon-32x32.png", favicon.clone())
+        .route("/apple-touch-icon.png", favicon.clone())
+        .route("/site.webmanifest", favicon.clone())
+        .route("/android-chrome-192x192.png", favicon.clone())
+        .route("/android-chrome-512x512.png", favicon);
 
     // Create the leptos app with its own state (fallback catches everything not matched above)
     let leptos_app = Router::new()
@@ -126,17 +127,6 @@ async fn main() {
 pub fn main() {
     // no client-side main function
     // see lib.rs for hydration function instead
-}
-
-#[cfg(feature = "ssr")]
-async fn serve_favicon(
-    request: axum::extract::Request,
-) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
-    use leptos::prelude::*;
-
-    // Resolve the site root from the build-time configuration and delegate.
-    let site_root = get_configuration(None).unwrap().leptos_options.site_root;
-    serve_favicon_at(request, site_root.as_ref()).await
 }
 
 /// Serves a static asset from `site_root`.
@@ -1397,7 +1387,6 @@ mod tests {
         ];
 
         // This test verifies that the routes we expect are handled
-        // In a real server setup, these would all map to the serve_favicon function
         for route in favicon_routes {
             assert!(route.starts_with('/'));
             assert!(!route.is_empty());
