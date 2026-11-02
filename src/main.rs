@@ -21,8 +21,12 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // Load environment variables
-    let carbon_data_dir =
-        env::var("CARBON_DATA_DIR").unwrap_or_else(|_| "/tmp/carbon/".to_string());
+    let carbon_data_dir = env::var("CARBON_DATA_DIR").unwrap_or_else(|_| {
+        warn!(
+            "CARBON_DATA_DIR not set, storing data in /tmp/carbon/, which may be cleared on reboot"
+        );
+        "/tmp/carbon/".to_string()
+    });
     let carbon_auth_key = env::var("CARBON_AUTH_KEY").expect("CARBON_AUTH_KEY must be set");
     let carbon_whitelist_ips = env::var("CARBON_WHITELIST_IPS").unwrap_or_else(|_| {
         warn!("CARBON_WHITELIST_IPS not set, you only get localhost");
