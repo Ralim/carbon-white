@@ -372,6 +372,45 @@ pub async fn handle_list(
     }
 }
 
+/// A file in the staging directory that is deleted when dropped, unless it was
+/// moved into place with [`StagedFile::persist`].
+///
+/// Dropping covers every early return as well as a client disconnect, which
+/// cancels the handler future mid-upload.
+struct StagedFile {
+    path: Option<PathBuf>,
+}
+
+impl StagedFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("path is only taken on persist or drop")
+    }
+
+    /// Moves the file to `destination`. On failure the staged file is removed.
+    async fn persist(mut self, destination: &Path) -> std::io::Result<()> {
+        tokio::fs::rename(self.path(), destination).await?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take()
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Could not remove staged upload {}: {}", path.display(), e);
+        }
+    }
+}
+
 /// A streamed upload that has been written and hashed but not yet committed to
 /// its final path.
 ///
@@ -379,7 +418,7 @@ pub async fn handle_list(
 /// derived from the content hash, which is not known until the upload has been
 /// read to the end.
 struct PendingUpload {
-    temp_path: PathBuf,
+    staged: StagedFile,
     original_filename: String,
     sha256: String,
 }
@@ -411,9 +450,11 @@ async fn stream_file_to_temp(
     })?;
 
     // The temporary name is random so simultaneous uploads cannot collide.
-    let temp_path = incoming.join(format!("{}.part", uuid::Uuid::new_v4()));
-    let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-        UploadError::Storage(format!("failed to create {}: {e}", temp_path.display()))
+    // The guard is declared before the handle: locals drop in reverse order,
+    // so the handle is closed before the guard deletes the file.
+    let staged = StagedFile::new(incoming.join(format!("{}.part", uuid::Uuid::new_v4())));
+    let mut file = tokio::fs::File::create(staged.path()).await.map_err(|e| {
+        UploadError::Storage(format!("failed to create {}: {e}", staged.path().display()))
     })?;
 
     let mut hasher = Sha256::new();
@@ -425,19 +466,17 @@ async fn stream_file_to_temp(
         total += chunk.len();
         if total > crate::MAX_UPLOAD_SIZE {
             // Stop reading immediately rather than draining the rest.
-            drop(file);
-            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(UploadError::TooLarge);
         }
 
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| {
-            UploadError::Storage(format!("failed to write {}: {e}", temp_path.display()))
+            UploadError::Storage(format!("failed to write {}: {e}", staged.path().display()))
         })?;
     }
 
     file.flush().await.map_err(|e| {
-        UploadError::Storage(format!("failed to flush {}: {e}", temp_path.display()))
+        UploadError::Storage(format!("failed to flush {}: {e}", staged.path().display()))
     })?;
     // The handle must be closed before the file is moved into place, otherwise
     // the rename races with the last write on some platforms.
@@ -446,7 +485,7 @@ async fn stream_file_to_temp(
     info!("File data size: {} bytes", total);
 
     Ok(PendingUpload {
-        temp_path,
+        staged,
         original_filename: filename.to_string(),
         sha256: hex::encode(hasher.finalize()),
     })
@@ -523,11 +562,9 @@ pub async fn handle_submit(
                 filename, content_type
             );
 
-            // A second file part would leave the first one's staged bytes
-            // unreachable, so discard them before overwriting the handle.
-            if let Some(previous) = uploaded.take() {
-                let _ = tokio::fs::remove_file(&previous.temp_path).await;
-            }
+            // A second file part replaces the first; dropping the previous
+            // upload deletes its staged bytes.
+            drop(uploaded.take());
 
             uploaded = match stream_file_to_temp(&mut field, &state.data_dir, &filename).await {
                 Ok(pending) => Some(pending),
@@ -559,12 +596,10 @@ pub async fn handle_submit(
         }
     }
 
-    // Validate required fields
+    // Every early return from here drops `uploaded`, which deletes the staged
+    // bytes.
     let title = form_data.get("title").cloned().unwrap_or_default();
     if title.trim().is_empty() {
-        if let Some(pending) = &uploaded {
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
-        }
         return Ok(Json(SubmitResponse {
             success: false,
             message: "Title is required".to_string(),
@@ -621,7 +656,6 @@ pub async fn handle_submit(
         Ok(Some(id)) => id,
         Ok(None) => {
             warn!("Rejected duplicate upload: {}", file_hash);
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
             return Ok(Json(SubmitResponse {
                 success: false,
                 message: "This file has already been uploaded.".to_string(),
@@ -630,7 +664,6 @@ pub async fn handle_submit(
         }
         Err(e) => {
             error!("Failed to store document in database: {}", e);
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -638,7 +671,7 @@ pub async fn handle_submit(
     // Both paths live under the data directory, so the rename stays on one
     // filesystem and the bytes are never copied a second time.
     let moved = match tokio::fs::create_dir_all(&file_dir).await {
-        Ok(()) => tokio::fs::rename(&pending.temp_path, &file_path).await,
+        Ok(()) => pending.staged.persist(&file_path).await,
         Err(e) => Err(e),
     };
     if let Err(e) = moved {
@@ -647,7 +680,6 @@ pub async fn handle_submit(
             file_path.display(),
             e
         );
-        let _ = tokio::fs::remove_file(&pending.temp_path).await;
         // Without its file the row would only ever serve a 404.
         if let Err(e) = database::delete_document_by_id(&state.database, id).await {
             error!("Failed to roll back document {}: {}", id, e);
@@ -934,6 +966,41 @@ mod tests {
 
         assert_eq!(response.results.len(), 0);
         assert_eq!(response.duration_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn test_staged_file_is_removed_on_drop_unless_persisted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let dropped = temp_dir.path().join("dropped.part");
+        std::fs::write(&dropped, b"bytes").unwrap();
+        drop(StagedFile::new(dropped.clone()));
+        assert!(!dropped.exists());
+
+        let kept = temp_dir.path().join("kept.part");
+        let destination = temp_dir.path().join("final.pdf");
+        std::fs::write(&kept, b"bytes").unwrap();
+        StagedFile::new(kept.clone())
+            .persist(&destination)
+            .await
+            .unwrap();
+        assert!(!kept.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"bytes");
+
+        // A failed move still cleans up.
+        let failed = temp_dir.path().join("failed.part");
+        std::fs::write(&failed, b"bytes").unwrap();
+        let missing_dir = temp_dir.path().join("missing").join("final.pdf");
+        assert!(
+            StagedFile::new(failed.clone())
+                .persist(&missing_dir)
+                .await
+                .is_err()
+        );
+        assert!(!failed.exists());
+
+        // A file that was never created is not an error.
+        drop(StagedFile::new(temp_dir.path().join("never-created.part")));
     }
 
     #[tokio::test]

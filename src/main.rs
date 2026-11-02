@@ -867,6 +867,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_malformed_upload_leaves_no_staged_file() {
+        use axum::http::StatusCode;
+
+        let (router, state, _temp) = upload_router().await;
+
+        // A complete file part followed by a field that never terminates.
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"a.pdf\"\r\n\r\n",
+        );
+        body.extend_from_slice(b"staged bytes");
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"notes\"\r\n\r\ncut off");
+
+        let response = post_submit(router, &state, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            staged_uploads(&state.data_dir).is_empty(),
+            "found: {:?}",
+            staged_uploads(&state.data_dir)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_without_title_leaves_no_staged_file() {
+        use axum::http::StatusCode;
+
+        let (router, state, _temp) = upload_router().await;
+        let response = post_submit(router, &state, multipart_body("", "a.pdf", b"bytes")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
     async fn test_submit_rejects_duplicate_file() {
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
