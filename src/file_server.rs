@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Path, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::get,
 };
@@ -17,9 +17,21 @@ pub fn create_file_routes() -> Router<AppState> {
     Router::new().route("/{sha256}", get(serve_file))
 }
 
+/// Request headers `ServeFile` uses for partial and conditional responses.
+const FORWARDED_HEADERS: [header::HeaderName; 6] = [
+    header::RANGE,
+    header::IF_RANGE,
+    header::IF_MATCH,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_UNMODIFIED_SINCE,
+];
+
 pub async fn serve_file(
     State(state): State<AppState>,
     Path(sha256): Path<String>,
+    method: Method,
+    request_headers: HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
     info!("File request for SHA256: {}", sha256);
 
@@ -42,14 +54,18 @@ pub async fn serve_file(
         }
     };
 
-    // Stream the file from disk including resume
-    let request = axum::http::Request::builder()
-        .uri("/")
-        .body(Body::empty())
-        .map_err(|e| {
-            error!("Failed to build file request: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Stream the file from disk. Range and validator headers are passed through
+    // so downloads can resume and cached copies revalidate with a 304.
+    let mut file_request = axum::http::Request::builder().method(method).uri("/");
+    for name in FORWARDED_HEADERS {
+        for value in request_headers.get_all(&name) {
+            file_request = file_request.header(&name, value);
+        }
+    }
+    let request = file_request.body(Body::empty()).map_err(|e| {
+        error!("Failed to build file request: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut response = ServeFile::new(&document.file_path)
         .oneshot(request)
@@ -338,6 +354,86 @@ mod tests {
 
         let state = AppState::new(pool, data_dir, "test-key");
         (create_file_routes().with_state(state), sha, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_honours_range_requests() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) = router_with_file("datasheet.pdf", b"0123456789").await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+        // The partial response is still hardened.
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"2345");
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_revalidates_with_304() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) = router_with_file("datasheet.pdf", b"cached").await;
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let last_modified = first.headers()[header::LAST_MODIFIED].clone();
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .header(header::IF_MODIFIED_SINCE, last_modified)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_head_has_no_body() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) = router_with_file("datasheet.pdf", b"0123456789").await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
