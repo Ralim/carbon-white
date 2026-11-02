@@ -87,12 +87,14 @@ When running, the project requires 3 env variables to set for correct performanc
 CARBON_DATA_DIR=/path/to/data/directory
 CARBON_AUTH_KEY=your-secret-auth-key
 CARBON_WHITELIST_IPS=127.0.0.1,::1,192.168.1.100,192.168.0.0/24
+CARBON_TRUSTED_PROXIES=10.0.0.1
 RECENT_FILE_COUNT=10
 ```
 
 - `CARBON_DATA_DIR`: Directory where files and database will be stored (defaults to `/tmp/carbon/`)
 - `CARBON_AUTH_KEY`: Secret key for authentication (required for production)
 - `CARBON_WHITELIST_IPS`: Comma-separated list of allowed IP addresses (empty = localhost only) for login
+- `CARBON_TRUSTED_PROXIES`: Comma-separated list of reverse proxy addresses or subnets. `X-Forwarded-For` / `X-Real-IP` are only honoured on connections from these peers (empty = headers ignored, the socket address is used)
 - `RECENT_FILE_COUNT`: Number of recent files to show on the homepage (default 10)
 
 #### Running in Development

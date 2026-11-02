@@ -28,9 +28,16 @@ async fn main() {
         warn!("CARBON_WHITELIST_IPS not set, you only get localhost");
         "127.0.0.1,::1".to_string()
     });
+    // Forwarding headers are only believed from these peers.
+    let carbon_trusted_proxies = env::var("CARBON_TRUSTED_PROXIES").unwrap_or_default();
 
     info!("Carbon data directory: `{}`", carbon_data_dir);
     info!("IP whitelist: `{}`", carbon_whitelist_ips);
+    if carbon_trusted_proxies.trim().is_empty() {
+        info!("No trusted proxies: forwarding headers are ignored");
+    } else {
+        info!("Trusted proxies: `{}`", carbon_trusted_proxies);
+    }
 
     // Create data directories
     std::fs::create_dir_all(&carbon_data_dir).expect("Failed to create data directory");
@@ -46,12 +53,9 @@ async fn main() {
         .expect("Failed to initialize database");
 
     // Create app state
-    let app_state = AppState {
-        database,
-        data_dir: carbon_data_dir,
-        auth_key: carbon_auth_key,
-        whitelist_ips: parse_ip_whitelist(&carbon_whitelist_ips),
-    };
+    let app_state = AppState::new(database, carbon_data_dir, carbon_auth_key)
+        .with_whitelist(parse_ip_whitelist(&carbon_whitelist_ips))
+        .with_trusted_proxies(parse_ip_whitelist(&carbon_trusted_proxies));
 
     // Setting get_configuration(None) means we'll be using cargo-leptos's env values
     let conf = get_configuration(None).unwrap();
@@ -243,16 +247,13 @@ mod tests {
             .await
             .expect("Failed to initialize test database");
 
-        let app_state = AppState {
-            database,
-            data_dir: temp_path.clone(),
-            auth_key: "test_auth_key".to_string(),
-            whitelist_ips: parse_ip_whitelist("127.0.0.1"),
-        };
+        let app_state = AppState::new(database, temp_path.clone(), "test_auth_key")
+            .with_whitelist(parse_ip_whitelist("127.0.0.1"));
 
         assert_eq!(app_state.data_dir, temp_path);
         assert_eq!(app_state.auth_key, "test_auth_key");
         assert_eq!(app_state.whitelist_ips.len(), 1);
+        assert!(app_state.trusted_proxies.is_empty());
     }
 
     #[tokio::test]
@@ -277,12 +278,8 @@ mod tests {
             .await
             .expect("Failed to initialize test database");
 
-        let app_state = AppState {
-            database,
-            data_dir: temp_path,
-            auth_key: "test_auth_key".to_string(),
-            whitelist_ips: parse_ip_whitelist("127.0.0.1"),
-        };
+        let app_state = AppState::new(database, temp_path, "test_auth_key")
+            .with_whitelist(parse_ip_whitelist("127.0.0.1"));
 
         // Test that we can create API routes
         let _api_routes = api::create_api_routes();
@@ -338,12 +335,8 @@ mod tests {
             .await
             .expect("Failed to initialize test database");
 
-        let app_state = AppState {
-            database,
-            data_dir: temp_path,
-            auth_key: "test_auth_key_123".to_string(),
-            whitelist_ips: vec![], // Empty whitelist allows loopback only
-        };
+        // Empty whitelist allows loopback only
+        let app_state = AppState::new(database, temp_path, "test_auth_key_123");
 
         // Create API router
         let api_router = api::create_api_routes().with_state(app_state);
@@ -456,14 +449,13 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let temp_path = temp_dir.path().to_string_lossy().to_string();
 
-        let app_state = AppState {
-            database: database::init_db(&temp_path)
+        let app_state = AppState::new(
+            database::init_db(&temp_path)
                 .await
                 .expect("Failed to initialize test database"),
-            data_dir: temp_path,
-            auth_key: "test_auth_key_123".to_string(),
-            whitelist_ips: vec![],
-        };
+            temp_path,
+            "test_auth_key_123",
+        );
 
         let api_router = api::create_api_routes().with_state(app_state);
 
@@ -491,6 +483,96 @@ mod tests {
 
         assert_eq!(result["success"], false);
         assert!(result["token"].is_null());
+    }
+
+    /// Sends a login request from `peer` with an optional `X-Forwarded-For`.
+    async fn login_from(
+        router: axum::Router,
+        peer: SocketAddr,
+        forwarded_for: Option<&str>,
+        key: &str,
+    ) -> serde_json::Value {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/auth")
+            .header("content-type", "application/json");
+        if let Some(forwarded_for) = forwarded_for {
+            builder = builder.header("x-forwarded-for", forwarded_for);
+        }
+        let mut request = builder
+            .body(Body::from(
+                serde_json::json!({ "auth_key": key }).to_string(),
+            ))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_auth_ignores_spoofed_forwarded_for_without_trusted_proxy() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let state = AppState::new(
+            database::init_db(&temp_path).await.unwrap(),
+            temp_path,
+            "test_auth_key_123",
+        );
+        let router = api::create_api_routes().with_state(state);
+
+        // Claiming to be loopback must not get a remote client past the whitelist.
+        let result = login_from(
+            router,
+            SocketAddr::from(([203, 0, 113, 7], 40000)),
+            Some("127.0.0.1"),
+            "test_auth_key_123",
+        )
+        .await;
+        assert_eq!(result["success"], false);
+        assert!(result["token"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_auth_believes_forwarded_for_from_trusted_proxy() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let state = AppState::new(
+            database::init_db(&temp_path).await.unwrap(),
+            temp_path,
+            "test_auth_key_123",
+        )
+        .with_whitelist(parse_ip_whitelist("192.168.0.0/24"))
+        .with_trusted_proxies(parse_ip_whitelist("10.0.0.1"));
+        let router = api::create_api_routes().with_state(state);
+        let proxy = SocketAddr::from(([10, 0, 0, 1], 40000));
+
+        let allowed = login_from(
+            router.clone(),
+            proxy,
+            Some("192.168.0.20"),
+            "test_auth_key_123",
+        )
+        .await;
+        assert_eq!(allowed["success"], true);
+
+        // The proxy appends the real address, so a spoofed left-most hop loses.
+        let refused = login_from(
+            router,
+            proxy,
+            Some("192.168.0.20, 203.0.113.7"),
+            "test_auth_key_123",
+        )
+        .await;
+        assert_eq!(refused["success"], false);
     }
 
     /// Builds a router over a temp database seeded with `count` documents.
@@ -527,12 +609,7 @@ mod tests {
             .expect("document should be inserted");
         }
 
-        let state = AppState {
-            database: pool,
-            data_dir: db_dir,
-            auth_key: "test_auth_key".to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(pool, db_dir, "test_auth_key");
 
         (api::create_api_routes().with_state(state), temp_dir)
     }
@@ -550,12 +627,7 @@ mod tests {
         std::fs::create_dir_all(format!("{}/files", db_dir)).unwrap();
 
         let pool = database::init_db(&db_dir).await.expect("Failed to init db");
-        let state = AppState {
-            database: pool,
-            data_dir: db_dir.clone(),
-            auth_key: auth_key.to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(pool, db_dir.clone(), auth_key);
         let router = api::create_api_routes().with_state(state);
 
         let token = create_jwt_token_with_secret(auth_key.as_bytes()).unwrap();

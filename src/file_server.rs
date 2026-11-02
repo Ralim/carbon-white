@@ -199,12 +199,7 @@ mod tests {
         .unwrap()
         .expect("document should insert");
 
-        let state = AppState {
-            database: pool,
-            data_dir: data_dir.to_string(),
-            auth_key: "test-key".to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(pool, data_dir, "test-key");
         let router = create_file_routes().with_state(state);
 
         let request = Request::builder()
@@ -234,12 +229,11 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().to_str().unwrap();
-        let state = AppState {
-            database: crate::database::init_db(data_dir).await.unwrap(),
-            data_dir: data_dir.to_string(),
-            auth_key: "test-key".to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(
+            crate::database::init_db(data_dir).await.unwrap(),
+            data_dir,
+            "test-key",
+        );
         let router = create_file_routes().with_state(state);
 
         let request = Request::builder()

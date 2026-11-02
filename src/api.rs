@@ -20,7 +20,7 @@ use crate::{
     AppState,
     auth::{
         AuthRequest, AuthResponse, create_jwt_token_with_secret, extract_token_from_headers,
-        get_client_ip, is_ip_whitelisted, validate_auth_key, verify_jwt_token_with_secret,
+        is_ip_whitelisted, resolve_client_ip, validate_auth_key, verify_jwt_token_with_secret,
     },
     database::{self, NewDocument},
     shared::AuthStatusResponse,
@@ -142,11 +142,8 @@ pub async fn handle_auth(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, StatusCode> {
-    let client_ip = get_client_ip(&headers, Some(addr));
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state.trusted_proxies);
     info!("Authentication attempt from {:?}", client_ip);
-
-    // Check IP whitelist if configured
-    // Get client IP from headers with fallback to connection info
 
     match client_ip {
         Some(ip) => {
@@ -162,7 +159,7 @@ pub async fn handle_auth(
         }
         None => {
             warn!(
-                "Could not determine client IP for authentication (checked headers and connection info)"
+                "Could not determine client IP for authentication (malformed forwarding headers from a trusted proxy)"
             );
             return Ok(Json(AuthResponse {
                 success: false,
@@ -838,40 +835,52 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
-    fn test_ip_whitelist_with_headers() {
-        // Whitelist contains 192.168.1.1
+    fn test_ip_whitelist_with_trusted_proxy_headers() {
         let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let trusted = vec![IPSubnet::try_from("127.0.0.1").unwrap()];
+        let proxy = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-        // X-Forwarded-For header present
+        // X-Forwarded-For from a trusted proxy
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1"));
-        let ip = get_client_ip(&headers, connect_info);
+        let ip = resolve_client_ip(&headers, proxy, &trusted);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
 
-        // X-Real-IP header present
+        // X-Real-IP from a trusted proxy
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.1"));
-        let ip = get_client_ip(&headers, connect_info);
+        let ip = resolve_client_ip(&headers, proxy, &trusted);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
 
         // Not whitelisted
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
-        let ip = get_client_ip(&headers, connect_info);
+        let ip = resolve_client_ip(&headers, proxy, &trusted);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(!is_ip_whitelisted(ip.unwrap(), &whitelist));
     }
 
     #[test]
+    fn test_ip_whitelist_spoofed_header_without_trusted_proxy() {
+        // A directly connected client claiming to be whitelisted is judged on
+        // its socket address alone.
+        let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1"));
+        let ip = resolve_client_ip(&headers, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), &[]);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_ip_whitelisted(ip.unwrap(), &whitelist));
+    }
+
+    #[test]
     fn test_ip_whitelist_with_connect_info_fallback() {
-        // Simulate no headers, fallback to ConnectInfo
+        // Simulate no headers, fallback to the socket peer
         let whitelist = vec![IPSubnet::try_from("127.0.0.1/32").unwrap()];
         let headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
-        let client_ip = get_client_ip(&headers, connect_info);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        let client_ip = resolve_client_ip(&headers, peer.ip(), &[]);
         assert_eq!(client_ip, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert!(is_ip_whitelisted(client_ip.unwrap(), &whitelist));
     }

@@ -171,46 +171,70 @@ pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IPSubnet]) -> bool {
     }
 }
 
-pub fn get_client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
-    // Try X-Forwarded-For header first (for reverse proxies), taking the first
-    // IP in the comma-separated list.
-    if let Some(ip) = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|forwarded| forwarded.split(',').next())
-        .and_then(|first| first.trim().parse::<IpAddr>().ok())
-    {
-        return Some(ip);
-    }
-
-    // Try X-Real-IP header
-    headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|real_ip| real_ip.parse::<IpAddr>().ok())
+fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[IPSubnet]) -> bool {
+    trusted_proxies.iter().any(|proxy| proxy.contains(&ip))
 }
 
-/// Get client IP address from headers with fallback to connection info
+/// Parses one forwarded address, tolerating the `ip:port` and `[ipv6]:port`
+/// forms some proxies emit.
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    value
+        .parse::<IpAddr>()
+        .or_else(|_| value.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()
+        .map(|ip| ip.to_canonical())
+}
+
+/// Resolves the address of the client that originated a request.
 ///
-/// This function first tries to extract the client IP from headers (X-Forwarded-For, X-Real-IP)
-/// and falls back to using the connection's remote address if no IP is found in headers.
+/// The socket peer is the client unless it is listed in `trusted_proxies`.
+/// Only then are forwarding headers consulted: `X-Forwarded-For` is walked
+/// right to left, skipping trusted hops, because proxies append to it and
+/// everything left of the first untrusted hop is client supplied. `X-Real-IP` is
+/// used when no `X-Forwarded-For` is present.
 ///
-/// # Arguments
-///
-/// * `headers` - HTTP headers that may contain forwarded IP information
-/// * `connect_info` - Optional socket address from the connection
-///
-/// # Returns
-///
-/// The client's IP address if found, None otherwise
-pub fn get_client_ip(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> Option<IpAddr> {
-    // First try to get IP from headers
-    if let Some(ip) = get_client_ip_from_headers(headers) {
-        return Some(ip);
+/// Returns `None` when a trusted proxy forwarded an address that cannot be
+/// parsed, so callers fail closed rather than guessing.
+pub fn resolve_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trusted_proxies: &[IPSubnet],
+) -> Option<IpAddr> {
+    let peer = peer.to_canonical();
+    if !is_trusted_proxy(peer, trusted_proxies) {
+        return Some(peer);
     }
 
-    // Fall back to connection info if available
-    connect_info.map(|addr| addr.ip())
+    // Repeated header lines are equivalent to a single comma-joined list.
+    let mut hops = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        hops.extend(
+            value
+                .to_str()
+                .ok()?
+                .split(',')
+                .map(str::trim)
+                .filter(|hop| !hop.is_empty()),
+        );
+    }
+
+    if !hops.is_empty() {
+        let mut client = peer;
+        for hop in hops.iter().rev() {
+            client = parse_forwarded_ip(hop)?;
+            if !is_trusted_proxy(client, trusted_proxies) {
+                return Some(client);
+            }
+        }
+        // Every hop is a trusted proxy, so the left-most one originated the request.
+        return Some(client);
+    }
+
+    match headers.get("x-real-ip") {
+        Some(value) => value.to_str().ok().and_then(parse_forwarded_ip),
+        None => Some(peer),
+    }
 }
 
 #[cfg(test)]
@@ -419,115 +443,140 @@ mod test_auth {
     }
 
     #[test]
-    fn test_get_client_ip_from_headers() {
+    fn test_resolve_client_ip_ignores_headers_from_untrusted_peer() {
         use axum::http::{HeaderMap, HeaderValue};
 
+        // Without a trusted proxy the headers are client controlled, so a
+        // spoofed loopback address must not be believed.
+        let peer = IpAddr::from_str("203.0.113.7").unwrap();
         let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        headers.insert("x-real-ip", HeaderValue::from_static("127.0.0.1"));
 
-        // Test X-Forwarded-For header
+        assert_eq!(resolve_client_ip(&headers, peer, &[]), Some(peer));
+
+        let unrelated_proxy = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &unrelated_proxy),
+            Some(peer)
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_uses_right_most_untrusted_hop() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let proxy = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+
+        // The client prepended a spoofed hop; the proxy appended the real one.
+        let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
-            HeaderValue::from_str("192.168.1.1, 10.0.0.1").unwrap(),
+            HeaderValue::from_static("127.0.0.1, 198.51.100.4"),
         );
         assert_eq!(
-            get_client_ip_from_headers(&headers),
-            Some(IpAddr::from_str("192.168.1.1").unwrap())
+            resolve_client_ip(&headers, proxy, &trusted),
+            Some(IpAddr::from_str("198.51.100.4").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_skips_chained_trusted_proxies() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.0/8").unwrap()];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.4, 10.0.0.2"),
+        );
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("198.51.100.4").unwrap())
         );
 
-        // Test X-Real-IP header
-        headers.clear();
-        headers.insert("x-real-ip", HeaderValue::from_str("192.168.1.2").unwrap());
+        // When every hop is trusted, the left-most one is the origin.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.3, 10.0.0.2"),
+        );
         assert_eq!(
-            get_client_ip_from_headers(&headers),
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("10.0.0.3").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_combines_repeated_headers() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.4"));
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("198.51.100.4").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_fails_closed_on_garbage() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(resolve_client_ip(&headers, peer, &trusted), None);
+
+        headers.clear();
+        headers.insert("x-real-ip", HeaderValue::from_static(""));
+        assert_eq!(resolve_client_ip(&headers, peer, &trusted), None);
+    }
+
+    #[test]
+    fn test_resolve_client_ip_from_trusted_proxy() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("::1").unwrap();
+        let trusted = vec![IPSubnet::try_from("::1").unwrap()];
+        let mut headers = HeaderMap::new();
+
+        // No forwarding headers: the proxy itself is the client.
+        assert_eq!(resolve_client_ip(&headers, peer, &trusted), Some(peer));
+
+        headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.2"));
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &trusted),
             Some(IpAddr::from_str("192.168.1.2").unwrap())
         );
 
-        // Test no IP headers
+        // Port suffixes are tolerated.
         headers.clear();
-        assert_eq!(get_client_ip_from_headers(&headers), None);
-    }
-
-    #[test]
-    fn test_get_client_ip_with_headers() {
-        use axum::http::{HeaderMap, HeaderValue};
-
-        let mut headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
-
-        // Test X-Forwarded-For header takes precedence
         headers.insert(
             "x-forwarded-for",
-            HeaderValue::from_str("192.168.1.1").unwrap(),
+            HeaderValue::from_static("192.168.1.3:5000, [2001:db8::1]:443"),
         );
         assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("192.168.1.1").unwrap())
-        );
-
-        // Test X-Real-IP header takes precedence
-        headers.clear();
-        headers.insert("x-real-ip", HeaderValue::from_str("10.0.0.1").unwrap());
-        assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("10.0.0.1").unwrap())
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("2001:db8::1").unwrap())
         );
     }
 
     #[test]
-    fn test_get_client_ip_fallback_to_connection() {
-        use axum::http::HeaderMap;
-
+    fn test_resolve_client_ip_canonicalises_mapped_peer() {
         let headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([192, 168, 1, 100], 54321)));
-
-        // Test fallback to connection info when no headers
+        let mapped = IpAddr::from_str("::ffff:192.168.1.5").unwrap();
         assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("192.168.1.100").unwrap())
-        );
-
-        // Test IPv6 connection
-        let ipv6_connect_info = Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080)));
-        assert_eq!(
-            get_client_ip(&headers, ipv6_connect_info),
-            Some(IpAddr::from_str("::1").unwrap())
-        );
-    }
-
-    #[test]
-    fn test_get_client_ip_no_source() {
-        use axum::http::HeaderMap;
-
-        let headers = HeaderMap::new();
-        let connect_info = None;
-
-        // Test no IP source available
-        assert_eq!(get_client_ip(&headers, connect_info), None);
-    }
-
-    #[test]
-    fn test_get_client_ip_invalid_header_fallback() {
-        use axum::http::{HeaderMap, HeaderValue};
-
-        let mut headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([10, 0, 0, 1], 9000)));
-
-        // Test invalid IP in header falls back to connection
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_str("invalid-ip").unwrap(),
-        );
-        assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("10.0.0.1").unwrap())
-        );
-
-        // Test empty header value falls back to connection
-        headers.clear();
-        headers.insert("x-real-ip", HeaderValue::from_str("").unwrap());
-        assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("10.0.0.1").unwrap())
+            resolve_client_ip(&headers, mapped, &[]),
+            Some(IpAddr::from_str("192.168.1.5").unwrap())
         );
     }
 }
