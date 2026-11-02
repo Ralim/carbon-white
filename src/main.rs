@@ -492,6 +492,15 @@ mod tests {
         forwarded_for: Option<&str>,
         key: &str,
     ) -> serde_json::Value {
+        login_with_status(router, peer, forwarded_for, key).await.1
+    }
+
+    async fn login_with_status(
+        router: axum::Router,
+        peer: SocketAddr,
+        forwarded_for: Option<&str>,
+        key: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
         use axum::body::Body;
         use axum::extract::ConnectInfo;
         use axum::http::{Method, Request};
@@ -512,10 +521,49 @@ mod tests {
         request.extensions_mut().insert(ConnectInfo(peer));
 
         let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        serde_json::from_slice(&body).unwrap()
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_auth_bans_after_repeated_failures() {
+        use axum::http::StatusCode;
+        use carbon_white::rate_limit::MAX_FAILED_ATTEMPTS;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let state = AppState::new(
+            database::init_db(&temp_path).await.unwrap(),
+            temp_path,
+            "test_auth_key_123",
+        )
+        .with_whitelist(parse_ip_whitelist("192.168.0.0/24"));
+        let router = api::create_api_routes().with_state(state);
+        let attacker = SocketAddr::from(([192, 168, 0, 66], 40000));
+
+        for _ in 1..MAX_FAILED_ATTEMPTS {
+            let (status, body) = login_with_status(router.clone(), attacker, None, "wrong").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["success"], false);
+        }
+        let (status, _) = login_with_status(router.clone(), attacker, None, "wrong").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // Once banned, even the correct key is refused.
+        let (status, body) =
+            login_with_status(router.clone(), attacker, None, "test_auth_key_123").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["success"], false);
+        assert!(body["token"].is_null());
+
+        // Other clients are unaffected.
+        let other = SocketAddr::from(([192, 168, 0, 67], 40000));
+        let (status, body) = login_with_status(router, other, None, "test_auth_key_123").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], true);
     }
 
     #[tokio::test]

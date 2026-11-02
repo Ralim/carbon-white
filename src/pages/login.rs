@@ -222,19 +222,19 @@ async fn perform_login(request: LoginRequest) -> Result<LoginResponse, String> {
         .await
         .map_err(|e| format!("Network error: {}", e))?;
 
-    if !response.ok() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("Login failed ({}): {}", status, error_text));
-    }
-
-    response
-        .json::<LoginResponse>()
+    // Error statuses such as 429 still carry a `LoginResponse` whose message is
+    // worth showing, so the body is parsed regardless of status.
+    let status = response.status();
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    match serde_json::from_str::<LoginResponse>(&body) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) if !response.ok() => Err(format!("Login failed ({}): {}", status, body)),
+        Err(e) => Err(format!("Failed to parse response: {}", e)),
+    }
 }
 
 #[cfg(test)]

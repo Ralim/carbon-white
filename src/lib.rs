@@ -13,6 +13,8 @@ pub mod database;
 #[cfg(feature = "ssr")]
 pub mod file_server;
 pub mod ip_subnet;
+#[cfg(feature = "ssr")]
+pub mod rate_limit;
 
 pub use app::*;
 
@@ -32,6 +34,8 @@ pub struct AppState {
     pub whitelist_ips: std::sync::Arc<[ip_subnet::IPSubnet]>,
     /// Peers whose `X-Forwarded-For` header is believed. Empty means none.
     pub trusted_proxies: std::sync::Arc<[ip_subnet::IPSubnet]>,
+    /// Failed login tracking, shared by every clone of the state.
+    pub login_limiter: std::sync::Arc<rate_limit::LoginRateLimiter>,
 }
 
 #[cfg(feature = "ssr")]
@@ -48,6 +52,7 @@ impl AppState {
             auth_key: auth_key.into(),
             whitelist_ips: Vec::new().into(),
             trusted_proxies: Vec::new().into(),
+            login_limiter: Default::default(),
         }
     }
 

@@ -1,8 +1,8 @@
 use axum::{
     Router,
     extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State, multipart::Field},
-    http::{HeaderMap, StatusCode},
-    response::Json,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json, Response},
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use crate::{
         is_ip_whitelisted, resolve_client_ip, validate_auth_key, verify_jwt_token_with_secret,
     },
     database::{self, NewDocument},
+    rate_limit::Attempt,
     shared::AuthStatusResponse,
 };
 
@@ -136,47 +137,77 @@ pub fn create_api_routes() -> Router<AppState> {
         .route("/document/{sha256}", put(handle_update_document))
 }
 
+/// Builds a failed login response.
+fn auth_failure(message: impl Into<String>) -> Json<AuthResponse> {
+    Json(AuthResponse {
+        success: false,
+        message: message.into(),
+        token: None,
+    })
+}
+
+/// A `429` telling the client how long its ban has left.
+fn auth_banned(retry_after: std::time::Duration) -> Response {
+    let hours = retry_after.as_secs().div_ceil(3600).max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::RETRY_AFTER,
+            retry_after.as_secs().max(1).to_string(),
+        )],
+        auth_failure(format!(
+            "Too many failed login attempts. Try again in about {hours} hour(s)."
+        )),
+    )
+        .into_response()
+}
+
 pub async fn handle_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<AuthRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let client_ip = resolve_client_ip(&headers, addr.ip(), &state.trusted_proxies);
     info!("Authentication attempt from {:?}", client_ip);
 
-    match client_ip {
+    let ip = match client_ip {
         Some(ip) => {
             if !is_ip_whitelisted(ip, &state.whitelist_ips) {
                 warn!("Authentication attempt from non-whitelisted IP: {}", ip);
-                return Ok(Json(AuthResponse {
-                    success: false,
-                    message: "Access denied from this IP address".to_string(),
-                    token: None,
-                }));
+                return Ok(auth_failure("Access denied from this IP address").into_response());
             }
             info!("IP {} is whitelisted", ip);
+            ip
         }
         None => {
             warn!(
                 "Could not determine client IP for authentication (malformed forwarding headers from a trusted proxy)"
             );
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "Could not verify IP address".to_string(),
-                token: None,
-            }));
+            return Ok(auth_failure("Could not verify IP address").into_response());
         }
-    }
+    };
 
-    // Validate auth key
-    if !validate_auth_key(&request.auth_key, &state.auth_key) {
-        warn!("Invalid auth key provided");
-        return Ok(Json(AuthResponse {
-            success: false,
-            message: "Invalid authentication key".to_string(),
-            token: None,
-        }));
+    let attempt = state
+        .login_limiter
+        .attempt(ip, || validate_auth_key(&request.auth_key, &state.auth_key));
+    match attempt {
+        Attempt::Succeeded => {}
+        Attempt::Failed { remaining } => {
+            warn!(
+                "Invalid auth key provided from {} ({} attempt(s) left)",
+                ip, remaining
+            );
+            return Ok(auth_failure("Invalid authentication key").into_response());
+        }
+        Attempt::Banned { retry_after } => {
+            warn!(
+                "Login from {} refused: banned for another {}s",
+                ip,
+                retry_after.as_secs()
+            );
+            return Ok(auth_banned(retry_after));
+        }
     }
 
     // Generate JWT token
@@ -188,7 +219,8 @@ pub async fn handle_auth(
                 success: true,
                 message: "Authentication successful".to_string(),
                 token: Some(token),
-            }))
+            })
+            .into_response())
         }
         Err(e) => {
             error!("Failed to create JWT token: {}", e);
