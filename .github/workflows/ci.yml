@@ -1,10 +1,11 @@
 # Continuous Integration for Carbon White.
 #
 # Gates, in order of increasing cost:
-#   1. formatting  - rustfmt
-#   2. lints       - clippy over three feature configurations
-#   3. unit tests  - default and `ssr` feature sets
-#   4. build       - `cargo leptos build` compiles wasm + SSR and emits the site
+#   1. audit       - cargo-audit against the RustSec advisory database
+#   2. formatting  - rustfmt
+#   3. lints       - clippy over three feature configurations
+#   4. unit tests  - default and `ssr` feature sets
+#   5. build       - `cargo leptos build` compiles wasm + SSR and emits the site
 #
 # Each feature set is linted separately on purpose. Code behind
 # `#[cfg(feature = ...)]` is never type-checked outside its own configuration, so
@@ -33,6 +34,7 @@ env:
   CARGO_TERM_COLOR: always
   # Keep in step with CARGO_LEPTOS_VERSION in the Dockerfile.
   CARGO_LEPTOS_VERSION: 0.3.11
+  CARGO_AUDIT_VERSION: 0.22.2
 
 jobs:
   build:
@@ -58,6 +60,14 @@ jobs:
 
       - name: Install cargo-leptos
         run: cargo binstall "cargo-leptos@${CARGO_LEPTOS_VERSION}" --no-confirm
+
+      - name: Install cargo-audit
+        run: cargo binstall "cargo-audit@${CARGO_AUDIT_VERSION}" --no-confirm
+
+      # Fails on any known vulnerability in Cargo.lock. Unmaintained-crate
+      # notices are reported but do not fail the build.
+      - name: Audit dependencies
+        run: cargo audit
 
       - name: Cache cargo and cargo-leptos artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -1,10 +1,16 @@
 use crate::ip_subnet::IPSubnet;
 use axum::http::HeaderMap;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::net::{IpAddr, SocketAddr};
 
 const JWT_EXPIRATION_HOURS: i64 = 24;
+
+/// The only JOSE header ever issued or accepted. Fixing it means a token can
+/// never select a different algorithm, such as `none`.
+const JWT_HEADER: &str = r#"{"alg":"HS256","typ":"JWT"}"#;
 
 /// Length of the session signing key, matching the HS256 block of SHA-256 output.
 pub const SIGNING_KEY_LEN: usize = 32;
@@ -38,7 +44,38 @@ pub struct AuthResponse {
     pub token: Option<String>,
 }
 
-pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
+/// Why a session token could not be issued or accepted.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenError {
+    #[error("token is not a well-formed HS256 JWT")]
+    Malformed,
+    #[error("token signature does not match")]
+    BadSignature,
+    #[error("token has expired")]
+    Expired,
+    #[error("failed to encode token claims: {0}")]
+    Encoding(#[from] serde_json::Error),
+}
+
+fn mac_for(secret: &[u8]) -> Hmac<Sha256> {
+    // HMAC accepts keys of any length, so this cannot fail.
+    <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length")
+}
+
+/// Encodes and signs `claims` as an HS256 JWT.
+fn sign_claims(secret: &[u8], claims: &Claims) -> Result<String, TokenError> {
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(JWT_HEADER),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?)
+    );
+    let mut mac = mac_for(secret);
+    mac.update(signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{signing_input}.{signature}"))
+}
+
+pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, TokenError> {
     let now = chrono::Utc::now();
     let exp = now + chrono::Duration::hours(JWT_EXPIRATION_HOURS);
 
@@ -48,21 +85,54 @@ pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, jsonwebtoke
         iat: now.timestamp() as usize,
     };
 
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret),
-    )
+    sign_claims(secret, &claims)
 }
 
-pub fn verify_jwt_token_with_secret(
-    secret: &[u8],
-    token: &str,
-) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let validation = Validation::new(Algorithm::HS256);
+/// Verifies an HS256 JWT issued by [`create_jwt_token_with_secret`].
+///
+/// The signature is checked in constant time before the payload is parsed,
+/// and a token is rejected once its `exp` has passed.
+pub fn verify_jwt_token_with_secret(secret: &[u8], token: &str) -> Result<Claims, TokenError> {
+    let mut segments = token.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(TokenError::Malformed);
+    };
 
-    decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)
-        .map(|token_data| token_data.claims)
+    let header_json: serde_json::Value = URL_SAFE_NO_PAD
+        .decode(header)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(TokenError::Malformed)?;
+    if header_json.get("alg").and_then(serde_json::Value::as_str) != Some("HS256") {
+        return Err(TokenError::Malformed);
+    }
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| TokenError::Malformed)?;
+    let mut mac = mac_for(secret);
+    mac.update(header.as_bytes());
+    mac.update(b".");
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| TokenError::BadSignature)?;
+
+    let claims: Claims = URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(TokenError::Malformed)?;
+
+    let now = chrono::Utc::now().timestamp();
+    if i64::try_from(claims.exp).map_or(true, |exp| exp <= now) {
+        return Err(TokenError::Expired);
+    }
+    Ok(claims)
 }
 
 /// Reads the session token from an `Authorization: Bearer` header.
@@ -183,7 +253,6 @@ pub fn resolve_client_ip(
 #[cfg(test)]
 mod test_auth {
     use super::*;
-    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::str::FromStr;
 
     #[test]
@@ -223,14 +292,67 @@ mod test_auth {
             exp: (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize,
             iat: (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp() as usize,
         };
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret),
-        )
-        .unwrap();
+        let token = sign_claims(secret, &claims).unwrap();
 
-        assert!(verify_jwt_token_with_secret(secret, &token).is_err());
+        assert!(matches!(
+            verify_jwt_token_with_secret(secret, &token),
+            Err(TokenError::Expired)
+        ));
+    }
+
+    #[test]
+    fn test_token_is_a_standard_hs256_jwt() {
+        let token = create_jwt_token_with_secret(b"secret").unwrap();
+        let segments: Vec<&str> = token.split('.').collect();
+        assert_eq!(segments.len(), 3);
+
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(segments[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "HS256");
+        assert_eq!(header["typ"], "JWT");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(segments[1]).unwrap()).unwrap();
+        assert_eq!(payload["sub"], "carbon_white_user");
+    }
+
+    #[test]
+    fn test_known_hs256_vector_verifies() {
+        // Signed independently of this module with HMAC-SHA256 over
+        // `{"alg":"HS256","typ":"JWT"}.{"sub":"carbon_white_user","exp":4102444800,"iat":0}`
+        // and the key `test-secret-for-unit-tests`.
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+            eyJzdWIiOiJjYXJib25fd2hpdGVfdXNlciIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjowfQ.\
+            HvQZqdIm7MkH6_n7xLfN6ywky97d8Fj6DtDjibMyftY";
+        let claims = verify_jwt_token_with_secret(b"test-secret-for-unit-tests", token).unwrap();
+        assert_eq!(claims.exp, 4_102_444_800);
+    }
+
+    #[test]
+    fn test_unsigned_and_foreign_algorithm_tokens_are_rejected() {
+        let secret = b"test-secret-for-unit-tests";
+        let valid = create_jwt_token_with_secret(secret).unwrap();
+        let payload = valid.split('.').nth(1).unwrap();
+
+        for header in [
+            r#"{"alg":"none"}"#,
+            r#"{"alg":"HS512"}"#,
+            r#"{"typ":"JWT"}"#,
+        ] {
+            let header = URL_SAFE_NO_PAD.encode(header);
+            for forged in [
+                format!("{header}.{payload}."),
+                format!("{header}.{payload}"),
+            ] {
+                assert!(
+                    verify_jwt_token_with_secret(secret, &forged).is_err(),
+                    "{forged} must be rejected"
+                );
+            }
+        }
+
+        assert!(verify_jwt_token_with_secret(secret, "").is_err());
+        assert!(verify_jwt_token_with_secret(secret, &format!("{valid}.extra")).is_err());
     }
 
     #[test]
