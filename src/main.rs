@@ -955,6 +955,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_document_returns_file_name_not_path() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use sha2::{Digest, Sha256};
+        use tower::ServiceExt;
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"path privacy";
+        let response = post_submit(
+            router.clone(),
+            &state,
+            multipart_body("Private", "../secret name.pdf", content),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hash = hex::encode(Sha256::digest(content));
+        let token = create_jwt_token_with_secret(&state.signing_key).unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/document/{hash}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["file_name"], "secret name.pdf");
+        assert!(json.get("file_path").is_none());
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&state.data_dir),
+            "the data directory must not leak: {json}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_malformed_upload_leaves_no_staged_file() {
         use axum::http::StatusCode;
 

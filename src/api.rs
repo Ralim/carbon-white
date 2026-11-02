@@ -737,7 +737,16 @@ pub struct DocumentResponse {
     pub storage_date: String,
     pub original_file_name: String,
     pub file_sha256: String,
-    pub file_path: String,
+    /// Name of the stored file. The server-side path is never exposed.
+    pub file_name: String,
+}
+
+/// The final component of a stored path.
+fn stored_file_name(file_path: &str) -> String {
+    Path::new(file_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub async fn handle_get_document(
@@ -775,8 +784,8 @@ pub async fn handle_get_document(
                 notes: document.notes,
                 storage_date: document.storage_date,
                 original_file_name: document.original_file_name,
+                file_name: stored_file_name(&document.file_path),
                 file_sha256: document.file_sha256,
-                file_path: document.file_path,
             }))
         }
         Ok(None) => {
