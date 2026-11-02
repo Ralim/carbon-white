@@ -719,6 +719,153 @@ mod tests {
         (api::create_api_routes().with_state(state), temp_dir)
     }
 
+    const BOUNDARY: &str = "----cwtestboundary";
+
+    /// Builds a multipart/form-data body with a title and a single file part.
+    fn multipart_body(title: &str, filename: &str, content: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"title\"\r\n\r\n");
+        body.extend_from_slice(title.as_bytes());
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    /// Posts a raw multipart body to `/submit` with a valid session token.
+    async fn post_submit(
+        router: axum::Router,
+        state: &AppState,
+        body: Vec<u8>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let token = create_jwt_token_with_secret(&state.signing_key).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/submit")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    /// A router and state over a fresh data directory.
+    async fn upload_router() -> (axum::Router, AppState, TempDir) {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        let data_dir = temp_dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(format!("{data_dir}/files")).unwrap();
+        let pool = database::init_db(&data_dir)
+            .await
+            .expect("Failed to init db");
+        let state = AppState::new(pool, data_dir, "upload_test_key");
+        let router = api::create_api_routes().with_state(state.clone());
+        (router, state, temp_dir)
+    }
+
+    fn staged_uploads(data_dir: &str) -> Vec<String> {
+        match std::fs::read_dir(format!("{data_dir}/files/.incoming")) {
+            Ok(entries) => entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_losing_duplicate_upload_keeps_stored_file() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"race contents";
+        let hash = hex::encode(Sha256::digest(content));
+
+        // Simulates the winner of a concurrent upload: its row and file are in
+        // place under the same sanitized name the loser will compute.
+        let stored = std::path::Path::new(&state.data_dir)
+            .join("files")
+            .join(&hash)
+            .join("same.pdf");
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, content).unwrap();
+        database::insert_document_if_absent(
+            &state.database,
+            database::NewDocument {
+                title: "Winner".to_string(),
+                part_number: None,
+                manufacturer: None,
+                document_id: None,
+                document_version: None,
+                package_marking: None,
+                device_address: None,
+                notes: None,
+                storage_date: "2024-01-01".to_string(),
+                original_file_name: "same.pdf".to_string(),
+                file_sha256: hash.clone(),
+                file_path: stored.to_string_lossy().to_string(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let response =
+            post_submit(router, &state, multipart_body("Loser", "same.pdf", content)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+
+        assert_eq!(std::fs::read(&stored).unwrap(), content);
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failed_move_rolls_back_database_row() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"cannot be stored";
+        let hash = hex::encode(Sha256::digest(content));
+
+        // A regular file where the hash directory belongs makes the move fail.
+        std::fs::write(
+            std::path::Path::new(&state.data_dir)
+                .join("files")
+                .join(&hash),
+            b"",
+        )
+        .unwrap();
+
+        let response =
+            post_submit(router, &state, multipart_body("Title", "doc.pdf", content)).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let row = database::get_document_by_sha256(&state.database, &hash)
+            .await
+            .unwrap();
+        assert!(row.is_none(), "a row without its file must not remain");
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
     #[tokio::test]
     async fn test_submit_rejects_duplicate_file() {
         use axum::body::Body;

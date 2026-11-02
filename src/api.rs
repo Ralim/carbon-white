@@ -591,55 +591,16 @@ pub async fn handle_submit(
         original_filename, file_hash
     );
 
-    // The bytes are already staged at this point, so a duplicate or a failed
-    // insert has to remove the staged copy. The final path is only chosen once
-    // the dedup check has passed.
-    match database::document_exists_by_sha256(&state.database, &file_hash).await {
-        Ok(true) => {
-            warn!("Rejected duplicate upload: {}", file_hash);
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
-            return Ok(Json(SubmitResponse {
-                success: false,
-                message: "This file has already been uploaded.".to_string(),
-                file_sha256: Some(file_hash),
-            }));
-        }
-        Ok(false) => {}
-        Err(e) => {
-            error!("Failed to check for an existing document: {}", e);
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
-
-    // Create file storage directory
-    let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
-
-    if let Err(e) = std::fs::create_dir_all(&file_dir) {
-        error!("Failed to create file directory: {}", e);
-        let _ = tokio::fs::remove_file(&pending.temp_path).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
     // The uploaded name is attacker controlled, so only ever use the sanitized
     // basename for the on-disk path. The raw name is kept in the database for
     // display only.
-    let stored_filename = sanitize_upload_filename(&original_filename);
-    let file_path = file_dir.join(&stored_filename);
+    let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
+    let file_path = file_dir.join(sanitize_upload_filename(&original_filename));
 
-    // Both paths live under the data directory, so the rename stays on one
-    // filesystem and the bytes are never copied a second time.
-    if let Err(e) = tokio::fs::rename(&pending.temp_path, &file_path).await {
-        error!(
-            "Failed to move upload into place at {}: {}",
-            file_path.display(),
-            e
-        );
-        let _ = tokio::fs::remove_file(&pending.temp_path).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // Create database record
+    // The row is inserted before the file is moved. The unique hash makes the
+    // insert the arbiter between concurrent uploads of the same bytes: only the
+    // winner ever writes the final path, so a losing duplicate cannot delete or
+    // replace the stored copy. It only discards its own staged bytes.
     let storage_date = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let new_document = NewDocument {
         title: title.clone(),
@@ -656,33 +617,50 @@ pub async fn handle_submit(
         file_path: file_path.to_string_lossy().to_string(),
     };
 
-    match database::insert_document_if_absent(&state.database, new_document).await {
-        Ok(Some(id)) => {
-            info!("Document {} stored successfully with ID: {}", title, id);
-            Ok(Json(SubmitResponse {
-                success: true,
-                message: "Document uploaded successfully".to_string(),
-                file_sha256: Some(file_hash),
-            }))
-        }
-        // Lost a race against a concurrent upload of the same file. Drop the
-        // bytes we just wrote so the stored copy is not duplicated on disk.
+    let id = match database::insert_document_if_absent(&state.database, new_document).await {
+        Ok(Some(id)) => id,
         Ok(None) => {
-            warn!("Duplicate upload rejected during insert: {}", file_hash);
-            let _ = tokio::fs::remove_file(&file_path).await;
-            Ok(Json(SubmitResponse {
+            warn!("Rejected duplicate upload: {}", file_hash);
+            let _ = tokio::fs::remove_file(&pending.temp_path).await;
+            return Ok(Json(SubmitResponse {
                 success: false,
                 message: "This file has already been uploaded.".to_string(),
                 file_sha256: Some(file_hash),
-            }))
+            }));
         }
         Err(e) => {
             error!("Failed to store document in database: {}", e);
-            // Clean up the file if database insertion fails
-            let _ = tokio::fs::remove_file(&file_path).await;
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            let _ = tokio::fs::remove_file(&pending.temp_path).await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
+    };
+
+    // Both paths live under the data directory, so the rename stays on one
+    // filesystem and the bytes are never copied a second time.
+    let moved = match tokio::fs::create_dir_all(&file_dir).await {
+        Ok(()) => tokio::fs::rename(&pending.temp_path, &file_path).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = moved {
+        error!(
+            "Failed to move upload into place at {}: {}",
+            file_path.display(),
+            e
+        );
+        let _ = tokio::fs::remove_file(&pending.temp_path).await;
+        // Without its file the row would only ever serve a 404.
+        if let Err(e) = database::delete_document_by_id(&state.database, id).await {
+            error!("Failed to roll back document {}: {}", id, e);
+        }
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    info!("Document {} stored successfully with ID: {}", title, id);
+    Ok(Json(SubmitResponse {
+        success: true,
+        message: "Document uploaded successfully".to_string(),
+        file_sha256: Some(file_hash),
+    }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
