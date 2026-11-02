@@ -103,7 +103,10 @@ async fn main() {
         .with_state(leptos_options);
 
     // Merge them together - order matters! Static and API routes first, then leptos fallback
-    let app = static_routes.merge(api_routes).merge(leptos_app);
+    let app = static_routes
+        .merge(api_routes)
+        .merge(leptos_app)
+        .layer(axum::middleware::map_response(security_headers::apply));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Carbon White server listening on http://{}", &addr);

@@ -15,6 +15,8 @@ pub mod file_server;
 pub mod ip_subnet;
 #[cfg(feature = "ssr")]
 pub mod rate_limit;
+#[cfg(feature = "ssr")]
+pub mod security_headers;
 
 pub use app::*;
 

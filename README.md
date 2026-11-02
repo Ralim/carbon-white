@@ -45,6 +45,7 @@ After 3 failed login attempts a client address (or IPv6 /64) is blocked from log
 
 - Click the "Download" button next to any search result
 - Files are served with original filenames
+- PDFs, raster images and plain text open in the browser; every other type (including HTML and SVG) is downloaded rather than rendered
 
 ## Developing
 
