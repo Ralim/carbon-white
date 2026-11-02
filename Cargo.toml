@@ -37,7 +37,11 @@ js-sys = "0.3"
 
 # Server dependencies
 axum = { version = "0.8", optional = true, features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tower-http = { version = "0.7", features = ["fs"], optional = true }
 sqlx = { version = "0.9", features = [
