@@ -13,6 +13,19 @@ use tracing::{error, info, warn};
 
 const JWT_EXPIRATION_HOURS: i64 = 24;
 
+/// Length of the session signing key, matching the HS256 block of SHA-256 output.
+pub const SIGNING_KEY_LEN: usize = 32;
+
+/// Draws a fresh session signing key from the OS RNG.
+///
+/// The login key is never used to sign tokens, so a leaked token cannot be
+/// used to brute-force it offline.
+pub fn generate_signing_key() -> [u8; SIGNING_KEY_LEN] {
+    let mut key = [0u8; SIGNING_KEY_LEN];
+    getrandom::fill(&mut key).expect("the OS random number generator is unavailable");
+    key
+}
+
 #[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct Claims {
     pub sub: String, // Subject (typically user ID)
@@ -103,7 +116,7 @@ pub async fn auth_middleware(
     };
 
     // Verify token
-    match verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token) {
+    match verify_jwt_token_with_secret(&state.signing_key, &token) {
         Ok(claims) => {
             info!("Valid token for user: {} accessing {}", claims.sub, path);
             Ok(next.run(request).await)
@@ -316,6 +329,23 @@ mod test_auth {
             JWT_EXPIRATION_HOURS * 3600,
             "token should live for exactly JWT_EXPIRATION_HOURS"
         );
+    }
+
+    #[test]
+    fn test_generate_signing_key_is_random() {
+        let first = generate_signing_key();
+        let second = generate_signing_key();
+        assert_ne!(first, second);
+        assert_ne!(first, [0u8; SIGNING_KEY_LEN]);
+    }
+
+    #[test]
+    fn test_token_from_previous_key_is_rejected() {
+        // A restart draws a new key, which must invalidate earlier tokens.
+        let before_restart = generate_signing_key();
+        let after_restart = generate_signing_key();
+        let token = create_jwt_token_with_secret(&before_restart).unwrap();
+        assert!(verify_jwt_token_with_secret(&after_restart, &token).is_err());
     }
 
     #[test]

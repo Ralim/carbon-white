@@ -626,6 +626,60 @@ mod tests {
         assert_eq!(refused["success"], false);
     }
 
+    #[tokio::test]
+    async fn test_tokens_are_signed_with_per_start_key() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let pool = database::init_db(&temp_path).await.unwrap();
+        let auth_key = "test_auth_key_123";
+
+        async fn is_authenticated(router: axum::Router, token: &str) -> bool {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/auth/status")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["authenticated"] == true
+        }
+
+        let first_start = api::create_api_routes().with_state(AppState::new(
+            pool.clone(),
+            temp_path.clone(),
+            auth_key,
+        ));
+        let token = login_from(
+            first_start.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 40000)),
+            None,
+            auth_key,
+        )
+        .await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(is_authenticated(first_start.clone(), &token).await);
+
+        // The login key must not be usable as a signing key.
+        let forged = create_jwt_token_with_secret(auth_key.as_bytes()).unwrap();
+        assert!(!is_authenticated(first_start, &forged).await);
+
+        // A restart with the same login key draws a new signing key.
+        let second_start =
+            api::create_api_routes().with_state(AppState::new(pool, temp_path, auth_key));
+        assert!(!is_authenticated(second_start, &token).await);
+    }
+
     /// Builds a router over a temp database seeded with `count` documents.
     ///
     /// The returned `TempDir` must be kept alive for as long as the pool is
@@ -679,9 +733,10 @@ mod tests {
 
         let pool = database::init_db(&db_dir).await.expect("Failed to init db");
         let state = AppState::new(pool, db_dir.clone(), auth_key);
+        let signing_key = state.signing_key.clone();
         let router = api::create_api_routes().with_state(state);
 
-        let token = create_jwt_token_with_secret(auth_key.as_bytes()).unwrap();
+        let token = create_jwt_token_with_secret(&signing_key).unwrap();
         let boundary = "----cwtestboundary";
         let content = b"identical file contents";
 

@@ -211,7 +211,7 @@ pub async fn handle_auth(
     }
 
     // Generate JWT token
-    match create_jwt_token_with_secret(state.auth_key.as_bytes()) {
+    match create_jwt_token_with_secret(&state.signing_key) {
         Ok(token) => {
             info!("Authentication successful, token generated");
 
@@ -234,7 +234,7 @@ pub async fn handle_auth_status(
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, StatusCode> {
     let authenticated = extract_token_from_headers(&headers)
-        .map(|token| verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token).is_ok())
+        .map(|token| verify_jwt_token_with_secret(&state.signing_key, &token).is_ok())
         .unwrap_or(false);
 
     Ok(Json(AuthStatusResponse { authenticated }))
@@ -496,7 +496,7 @@ pub async fn handle_submit(
         }
     };
 
-    if let Err(e) = verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token) {
+    if let Err(e) = verify_jwt_token_with_secret(&state.signing_key, &token) {
         warn!("Invalid token for file submission: {}", e);
         return Ok(Json(SubmitResponse {
             success: false,
@@ -855,7 +855,7 @@ fn authenticate_request(headers: &HeaderMap, state: &AppState) -> bool {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| verify_jwt_token_with_secret(state.auth_key.as_bytes(), token).is_ok())
+        .map(|token| verify_jwt_token_with_secret(&state.signing_key, token).is_ok())
         .unwrap_or(false)
 }
 

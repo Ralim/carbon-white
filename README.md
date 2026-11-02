@@ -19,6 +19,8 @@ The _intent_ is that this can be self hosted at home or a workplace easily, then
 2. Enter the authentication key configured in `CARBON_AUTH_KEY`
 3. Upon successful authentication, you'll be redirected to the search page, and can see the submit button now
 
+Sessions last 24 hours. They are signed with a random key generated when the server starts, so restarting the server logs everyone out.
+
 After 3 failed login attempts a client address (or IPv6 /64) is blocked from logging in for 24 hours. Bans are held in memory only and are cleared when the server restarts.
 
 ### Searching Documents

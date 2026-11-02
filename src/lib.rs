@@ -38,6 +38,9 @@ pub struct AppState {
     pub trusted_proxies: std::sync::Arc<[ip_subnet::IPSubnet]>,
     /// Failed login tracking, shared by every clone of the state.
     pub login_limiter: std::sync::Arc<rate_limit::LoginRateLimiter>,
+    /// Random key that signs session tokens. Regenerated on every start, so a
+    /// restart logs everyone out.
+    pub signing_key: std::sync::Arc<[u8]>,
 }
 
 #[cfg(feature = "ssr")]
@@ -55,6 +58,7 @@ impl AppState {
             whitelist_ips: Vec::new().into(),
             trusted_proxies: Vec::new().into(),
             login_limiter: Default::default(),
+            signing_key: auth::generate_signing_key().into(),
         }
     }
 
