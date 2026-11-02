@@ -27,6 +27,11 @@ pub struct SearchResponse {
     pub duration_ms: u128,
 }
 
+/// Pause after the last keystroke before a search is sent. Kept short to
+/// favour latency; superseded responses are discarded anyway.
+#[cfg(feature = "hydrate")]
+const SEARCH_DEBOUNCE_MS: u32 = 20;
+
 #[component]
 pub fn HomePage() -> impl IntoView {
     let (search_term, set_search_term) = signal(String::new());
@@ -71,34 +76,47 @@ pub fn HomePage() -> impl IntoView {
         });
     });
 
-    // Load recent files on page load and perform search
+    // Load recent files on page load and perform search. Typing is debounced,
+    // and a response is only applied while it belongs to the newest search, so
+    // a slow earlier request cannot overwrite later results or clear the
+    // spinner early.
     #[cfg(feature = "hydrate")]
-    Effect::new(move |_| {
-        let term = search_term.get();
+    {
+        let latest = crate::shared::LatestRequest::default();
+        Effect::new(move |_| {
+            let term = search_term.get();
+            let id = latest.begin();
+            let latest = latest.clone();
 
-        set_is_searching.set(true);
-        use leptos::task::spawn_local;
-        spawn_local(async move {
-            let result = if term.trim().is_empty() {
-                // Load recent files when no search term
-                perform_search("").await
-            } else {
-                // Perform actual search
-                perform_search(&term).await
-            };
+            set_is_searching.set(true);
+            use leptos::task::spawn_local;
+            spawn_local(async move {
+                if !term.trim().is_empty() {
+                    gloo_timers::future::TimeoutFuture::new(SEARCH_DEBOUNCE_MS).await;
+                    if !latest.is_current(id) {
+                        return;
+                    }
+                }
 
-            match result {
-                Ok(response) => {
-                    set_search_results.set(response.results);
+                // An empty term loads the recent files.
+                let result = perform_search(&term).await;
+                if !latest.is_current(id) {
+                    return;
                 }
-                Err(e) => {
-                    leptos::logging::error!("Search/load error: {}", e);
-                    set_search_results.set(Vec::new());
+
+                match result {
+                    Ok(response) => {
+                        set_search_results.set(response.results);
+                    }
+                    Err(e) => {
+                        leptos::logging::error!("Search/load error: {}", e);
+                        set_search_results.set(Vec::new());
+                    }
                 }
-            }
-            set_is_searching.set(false);
+                set_is_searching.set(false);
+            });
         });
-    });
+    }
 
     view! {
         <div class="app-container">
