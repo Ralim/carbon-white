@@ -1,15 +1,8 @@
-use crate::AppState;
 use crate::ip_subnet::IPSubnet;
-use axum::{
-    extract::{Request, State},
-    http::{HeaderMap, StatusCode},
-    middleware::Next,
-    response::Response,
-};
+use axum::http::HeaderMap;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use tracing::{error, info, warn};
 
 const JWT_EXPIRATION_HOURS: i64 = 24;
 
@@ -72,84 +65,21 @@ pub fn verify_jwt_token_with_secret(
         .map(|token_data| token_data.claims)
 }
 
-pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    // Try to get token from Authorization header
-    if let Some(token) = headers
+/// Reads the session token from an `Authorization: Bearer` header.
+///
+/// Cookies are deliberately not accepted: the browser attaches them to
+/// cross-site requests, which would open the API to request forgery.
+pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-    {
-        return Some(token.to_string());
-    }
-
-    // Try to get token from cookie
-    headers
-        .get("cookie")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let (name, value) = cookie.trim().split_once('=')?;
-                (name.trim() == "carbon_auth_token").then(|| value.trim().to_string())
-            })
-        })
 }
 
-pub async fn auth_middleware(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    // Skip auth for public endpoints
-    let path = request.uri().path();
-    if is_public_endpoint(path) {
-        return Ok(next.run(request).await);
-    }
-
-    // Extract token from headers
-    let token = match extract_token_from_headers(&headers) {
-        Some(token) => token,
-        None => {
-            warn!("No auth token found for protected endpoint: {}", path);
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    };
-
-    // Verify token
-    match verify_jwt_token_with_secret(&state.signing_key, &token) {
-        Ok(claims) => {
-            info!("Valid token for user: {} accessing {}", claims.sub, path);
-            Ok(next.run(request).await)
-        }
-        Err(e) => {
-            error!("Invalid token for endpoint {}: {}", path, e);
-            Err(StatusCode::UNAUTHORIZED)
-        }
-    }
-}
-
-fn is_public_endpoint(path: &str) -> bool {
-    // Public endpoints that don't require authentication
-    let public_paths = [
-        "/",
-        "/login",
-        "/api/search",
-        "/api/auth",
-        "/file/",
-        "/pkg/",
-        "/assets/",
-    ];
-
-    public_paths.iter().any(|&public_path| {
-        if public_path == "/" {
-            // Root path should only match exactly
-            path == "/"
-        } else if public_path.ends_with('/') {
-            path.starts_with(public_path)
-        } else {
-            path == public_path
-        }
-    })
+/// True when the request carries a valid, unexpired session token.
+pub fn is_request_authenticated(headers: &HeaderMap, signing_key: &[u8]) -> bool {
+    extract_token_from_headers(headers)
+        .is_some_and(|token| verify_jwt_token_with_secret(signing_key, token).is_ok())
 }
 
 pub fn validate_auth_key(provided_key: &str, expected_key: &str) -> bool {
@@ -413,40 +343,6 @@ mod test_auth {
     }
 
     #[test]
-    fn test_is_public_endpoint() {
-        // Test public endpoints
-        assert!(is_public_endpoint("/"));
-        assert!(is_public_endpoint("/login"));
-        assert!(is_public_endpoint("/api/search"));
-        assert!(is_public_endpoint("/api/auth"));
-        assert!(is_public_endpoint("/file/abc123"));
-        assert!(is_public_endpoint("/pkg/app.js"));
-        assert!(is_public_endpoint("/assets/logo.png"));
-
-        // Test protected endpoints
-        assert!(!is_public_endpoint("/submit"));
-        assert!(!is_public_endpoint("/api/submit"));
-        assert!(!is_public_endpoint("/admin"));
-    }
-
-    #[test]
-    fn test_is_public_endpoint_root_is_exact_match() {
-        // A prefix-style match on `/` would expose every route, so only the
-        // bare root may be public.
-        assert!(!is_public_endpoint("/submit"));
-        assert!(!is_public_endpoint("/anything-else"));
-    }
-
-    #[test]
-    fn test_is_public_endpoint_prefix_paths() {
-        // Prefix entries are anchored on the trailing slash, so a sibling path
-        // that merely shares the prefix must not become public.
-        assert!(is_public_endpoint("/file/deadbeef"));
-        assert!(!is_public_endpoint("/files/deadbeef"));
-        assert!(!is_public_endpoint("/pkgfiles/app.js"));
-    }
-
-    #[test]
     fn test_extract_token_from_headers() {
         use axum::http::{HeaderMap, HeaderValue};
 
@@ -457,25 +353,49 @@ mod test_auth {
             "authorization",
             HeaderValue::from_str("Bearer test_token").unwrap(),
         );
-        assert_eq!(
-            extract_token_from_headers(&headers),
-            Some("test_token".to_string())
-        );
+        assert_eq!(extract_token_from_headers(&headers), Some("test_token"));
 
-        // Test cookie
+        // Cookies are ignored, so a cross-site request cannot authenticate.
         headers.clear();
         headers.insert(
             "cookie",
             HeaderValue::from_str("carbon_auth_token=cookie_token; other=value").unwrap(),
         );
-        assert_eq!(
-            extract_token_from_headers(&headers),
-            Some("cookie_token".to_string())
-        );
+        assert_eq!(extract_token_from_headers(&headers), None);
+
+        // Other schemes are not bearer tokens.
+        headers.clear();
+        headers.insert("authorization", HeaderValue::from_static("Basic abc"));
+        assert_eq!(extract_token_from_headers(&headers), None);
 
         // Test no token
         headers.clear();
         assert_eq!(extract_token_from_headers(&headers), None);
+    }
+
+    #[test]
+    fn test_is_request_authenticated() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let key = generate_signing_key();
+        let token = create_jwt_token_with_secret(&key).unwrap();
+
+        let mut headers = HeaderMap::new();
+        assert!(!is_request_authenticated(&headers, &key));
+
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert!(is_request_authenticated(&headers, &key));
+        assert!(!is_request_authenticated(&headers, &generate_signing_key()));
+
+        headers.clear();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("carbon_auth_token={token}")).unwrap(),
+        );
+        assert!(!is_request_authenticated(&headers, &key));
     }
 
     #[test]

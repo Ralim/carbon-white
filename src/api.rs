@@ -20,7 +20,8 @@ use crate::{
     AppState,
     auth::{
         AuthRequest, AuthResponse, create_jwt_token_with_secret, extract_token_from_headers,
-        is_ip_whitelisted, resolve_client_ip, validate_auth_key, verify_jwt_token_with_secret,
+        is_ip_whitelisted, is_request_authenticated, resolve_client_ip, validate_auth_key,
+        verify_jwt_token_with_secret,
     },
     database::{self, NewDocument},
     rate_limit::Attempt,
@@ -242,9 +243,7 @@ pub async fn handle_auth_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, StatusCode> {
-    let authenticated = extract_token_from_headers(&headers)
-        .map(|token| verify_jwt_token_with_secret(&state.signing_key, &token).is_ok())
-        .unwrap_or(false);
+    let authenticated = authenticate_request(&headers, &state);
 
     Ok(Json(AuthStatusResponse { authenticated }))
 }
@@ -544,7 +543,7 @@ pub async fn handle_submit(
         }
     };
 
-    if let Err(e) = verify_jwt_token_with_secret(&state.signing_key, &token) {
+    if let Err(e) = verify_jwt_token_with_secret(&state.signing_key, token) {
         warn!("Invalid token for file submission: {}", e);
         return Ok(Json(SubmitResponse {
             success: false,
@@ -875,17 +874,9 @@ pub async fn handle_update_document(
     }
 }
 
-/// Checks the bearer token on a request against the configured auth key.
-///
-/// Returns `true` only when a well-formed `Authorization: Bearer <token>` header
-/// carries a token that verifies and has not expired.
+/// Checks the bearer token on a request against the session signing key.
 fn authenticate_request(headers: &HeaderMap, state: &AppState) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| verify_jwt_token_with_secret(&state.signing_key, token).is_ok())
-        .unwrap_or(false)
+    is_request_authenticated(headers, &state.signing_key)
 }
 
 #[cfg(test)]

@@ -930,6 +930,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_ignores_cookie_token() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let (router, state, _temp) = upload_router().await;
+        let token = create_jwt_token_with_secret(&state.signing_key).unwrap();
+
+        // A cross-site form post would carry cookies but cannot set headers.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/submit")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .header("cookie", format!("carbon_auth_token={token}"))
+            .body(Body::from(multipart_body("Forged", "f.pdf", b"forged")))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["message"], "Authentication required");
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
     async fn test_malformed_upload_leaves_no_staged_file() {
         use axum::http::StatusCode;
 
