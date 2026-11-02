@@ -723,11 +723,20 @@ mod tests {
 
     /// Builds a multipart/form-data body with a title and a single file part.
     fn multipart_body(title: &str, filename: &str, content: &[u8]) -> Vec<u8> {
+        multipart_with_fields(&[("title", title)], filename, content)
+    }
+
+    /// Builds a multipart/form-data body with text fields and a single file part.
+    fn multipart_with_fields(fields: &[(&str, &str)], filename: &str, content: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
-        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
-        body.extend_from_slice(b"Content-Disposition: form-data; name=\"title\"\r\n\r\n");
-        body.extend_from_slice(title.as_bytes());
-        body.extend_from_slice(b"\r\n");
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
         body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
         body.extend_from_slice(
             format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
@@ -864,6 +873,41 @@ mod tests {
             .unwrap();
         assert!(row.is_none(), "a row without its file must not remain");
         assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_stores_blank_fields_as_null() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"normalised";
+
+        // The submit page always sends every field, blank or not.
+        let body = multipart_with_fields(
+            &[
+                ("title", "  Spaced Title  "),
+                ("part_number", ""),
+                ("manufacturer", "   "),
+                ("notes", " kept "),
+            ],
+            "n.pdf",
+            content,
+        );
+        let response = post_submit(router, &state, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = database::get_document_by_sha256(
+            &state.database,
+            &hex::encode(Sha256::digest(content)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.title, "Spaced Title");
+        assert_eq!(stored.part_number, None);
+        assert_eq!(stored.manufacturer, None);
+        assert_eq!(stored.notes.as_deref(), Some("kept"));
     }
 
     #[tokio::test]

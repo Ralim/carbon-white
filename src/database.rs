@@ -1,7 +1,7 @@
 use sqlx::{FromRow, Row, Sqlite, SqlitePool, migrate::MigrateDatabase, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn init_db(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
     let db_path = Path::new(data_dir).join("carbon.db");
@@ -58,6 +58,23 @@ pub async fn init_db(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
     create_fts_index(&pool).await?;
     drop_unused_columns(&pool).await?;
     create_part_number_index(&pool).await?;
+    normalize_blank_fields(&pool).await?;
+
+    let version = schema_version(&pool).await?;
+    if version < LATEST_SCHEMA_VERSION {
+        return Err(sqlx::Error::Configuration(
+            format!(
+                "migrations left the schema at version {version}, expected {LATEST_SCHEMA_VERSION}"
+            )
+            .into(),
+        ));
+    }
+    if version > LATEST_SCHEMA_VERSION {
+        warn!(
+            "Database schema version {} is newer than this build supports ({})",
+            version, LATEST_SCHEMA_VERSION
+        );
+    }
 
     info!("Database initialized successfully");
     Ok(pool)
@@ -116,6 +133,13 @@ const UNUSED_COLUMNS_SCHEMA_VERSION: i64 = 2;
 /// `user_version` value recorded once the part number trigram index is populated.
 const PART_NUMBER_INDEX_SCHEMA_VERSION: i64 = 3;
 
+/// `user_version` value recorded once blank optional metadata is stored as NULL
+/// and surrounding whitespace has been trimmed.
+const BLANK_FIELDS_SCHEMA_VERSION: i64 = 4;
+
+/// The version `init_db` leaves a database at.
+const LATEST_SCHEMA_VERSION: i64 = BLANK_FIELDS_SCHEMA_VERSION;
+
 /// Rows a single search returns at most.
 const SEARCH_RESULT_LIMIT: i64 = 100;
 
@@ -171,6 +195,51 @@ async fn drop_unused_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     set_schema_version(pool, UNUSED_COLUMNS_SCHEMA_VERSION).await?;
+    Ok(())
+}
+
+/// Rewrites metadata stored before input was normalised: whitespace is trimmed
+/// and blank optional fields become NULL, matching what the API now writes.
+async fn normalize_blank_fields(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if schema_version(pool).await? >= BLANK_FIELDS_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // Matches what Rust's `str::trim` removes for ASCII input.
+    const WS: &str = "' ' || char(9) || char(10) || char(11) || char(12) || char(13)";
+    let optional = [
+        "part_number",
+        "manufacturer",
+        "document_id",
+        "document_version",
+        "package_marking",
+        "device_address",
+        "notes",
+    ];
+
+    let mut assignments = vec![format!("title = TRIM(title, {WS})")];
+    let mut changed = vec![format!("title IS NOT TRIM(title, {WS})")];
+    for column in optional {
+        let normalized = format!("NULLIF(TRIM({column}, {WS}), '')");
+        assignments.push(format!("{column} = {normalized}"));
+        changed.push(format!("{column} IS NOT {normalized}"));
+    }
+
+    // Only touched rows are rewritten, so the FTS update triggers fire for
+    // those alone.
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE documents SET {} WHERE {};",
+        assignments.join(", "),
+        changed.join(" OR ")
+    )))
+    .execute(pool)
+    .await?;
+
+    set_schema_version(pool, BLANK_FIELDS_SCHEMA_VERSION).await?;
+    info!(
+        "Normalised blank metadata on {} document(s)",
+        result.rows_affected()
+    );
     Ok(())
 }
 
@@ -1231,13 +1300,15 @@ mod tests {
             .unwrap();
         // init_db runs every migration step, so the recorded version is the
         // last one's.
-        assert_eq!(version, PART_NUMBER_INDEX_SCHEMA_VERSION);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         // Every step must record a higher version than the ones before it. If a
         // later step claimed a lower one, an earlier guard would consider its
         // work already done and skip a backfill.
         const {
             assert!(UNUSED_COLUMNS_SCHEMA_VERSION > FTS_SCHEMA_VERSION);
             assert!(PART_NUMBER_INDEX_SCHEMA_VERSION > UNUSED_COLUMNS_SCHEMA_VERSION);
+            assert!(BLANK_FIELDS_SCHEMA_VERSION > PART_NUMBER_INDEX_SCHEMA_VERSION);
+            assert!(LATEST_SCHEMA_VERSION >= BLANK_FIELDS_SCHEMA_VERSION);
         };
 
         // Re-running the migration on a populated index must not duplicate or
@@ -1432,7 +1503,7 @@ mod tests {
         // must be a no-op rather than an error.
         let first = init_db(data_dir).await.unwrap();
         let version = schema_version(&first).await.unwrap();
-        assert_eq!(version, PART_NUMBER_INDEX_SCHEMA_VERSION);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         first.close().await;
 
         let second = init_db(data_dir).await.unwrap();
@@ -1722,8 +1793,44 @@ mod tests {
         assert_eq!(found[0].part_number.as_deref(), Some("PN-7788"));
         assert_eq!(
             schema_version(&migrated).await.unwrap(),
-            PART_NUMBER_INDEX_SCHEMA_VERSION
+            LATEST_SCHEMA_VERSION
         );
+    }
+
+    #[tokio::test]
+    async fn test_blank_fields_are_normalised_by_migration() {
+        let test_db = setup_test_db().await;
+        let mut legacy = doc("  Padded Title \n", "sha-blank");
+        legacy.part_number = Some("".to_string());
+        legacy.manufacturer = Some("  \t ".to_string());
+        legacy.notes = Some("  keep me  ".to_string());
+        insert(&test_db.pool, legacy).await;
+        insert(&test_db.pool, doc("Already Clean", "sha-clean")).await;
+
+        // Roll the marker back to before the migration existed.
+        set_schema_version(&test_db.pool, PART_NUMBER_INDEX_SCHEMA_VERSION)
+            .await
+            .unwrap();
+        normalize_blank_fields(&test_db.pool).await.unwrap();
+
+        let migrated = get_document_by_sha256(&test_db.pool, "sha-blank")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.title, "Padded Title");
+        assert_eq!(migrated.part_number, None);
+        assert_eq!(migrated.manufacturer, None);
+        assert_eq!(migrated.notes.as_deref(), Some("keep me"));
+        assert_eq!(
+            schema_version(&test_db.pool).await.unwrap(),
+            BLANK_FIELDS_SCHEMA_VERSION
+        );
+
+        // The FTS triggers kept the index in step with the rewrite.
+        let found = search_documents(&test_db.pool, "padded").await.unwrap();
+        assert_eq!(found.len(), 1);
+        let found = search_documents(&test_db.pool, "keep").await.unwrap();
+        assert_eq!(found.len(), 1);
     }
 
     #[tokio::test]

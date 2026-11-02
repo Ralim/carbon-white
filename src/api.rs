@@ -64,6 +64,15 @@ pub struct SubmitResponse {
 /// filesystem limit
 const MAX_FILENAME_LEN: usize = 200;
 
+/// Trims a metadata value and maps blank input to `None`, so an omitted field
+/// and an empty one are both stored as NULL.
+fn normalize_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Reduces a client-supplied upload filename to a single safe path component.
 fn sanitize_upload_filename(raw: &str) -> String {
     // `rsplit` on both separators so that Windows-style paths are handled too.
@@ -637,15 +646,17 @@ pub async fn handle_submit(
     // winner ever writes the final path, so a losing duplicate cannot delete or
     // replace the stored copy. It only discards its own staged bytes.
     let storage_date = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let field = |name: &str| normalize_field(form_data.get(name).map(String::as_str));
+    let title = title.trim().to_string();
     let new_document = NewDocument {
         title: title.clone(),
-        part_number: form_data.get("part_number").cloned(),
-        manufacturer: form_data.get("manufacturer").cloned(),
-        document_id: form_data.get("document_id").cloned(),
-        document_version: form_data.get("document_version").cloned(),
-        package_marking: form_data.get("package_marking").cloned(),
-        device_address: form_data.get("device_address").cloned(),
-        notes: form_data.get("notes").cloned(),
+        part_number: field("part_number"),
+        manufacturer: field("manufacturer"),
+        document_id: field("document_id"),
+        document_version: field("document_version"),
+        package_marking: field("package_marking"),
+        device_address: field("device_address"),
+        notes: field("notes"),
         storage_date,
         original_file_name: original_filename,
         file_sha256: file_hash.clone(),
@@ -812,19 +823,27 @@ pub async fn handle_update_document(
     // Check if document exists
     match database::get_document_by_sha256(&state.database, &sha256).await {
         Ok(Some(_existing_doc)) => {
+            let part_number = normalize_field(update_request.part_number.as_deref());
+            let manufacturer = normalize_field(update_request.manufacturer.as_deref());
+            let document_id = normalize_field(update_request.document_id.as_deref());
+            let document_version = normalize_field(update_request.document_version.as_deref());
+            let package_marking = normalize_field(update_request.package_marking.as_deref());
+            let device_address = normalize_field(update_request.device_address.as_deref());
+            let notes = normalize_field(update_request.notes.as_deref());
+
             // Update the document
             match database::update_document_metadata(
                 &state.database,
                 &sha256,
                 &database::DocumentMetadataUpdate {
-                    title: &update_request.title,
-                    part_number: update_request.part_number.as_deref(),
-                    manufacturer: update_request.manufacturer.as_deref(),
-                    document_id: update_request.document_id.as_deref(),
-                    document_version: update_request.document_version.as_deref(),
-                    package_marking: update_request.package_marking.as_deref(),
-                    device_address: update_request.device_address.as_deref(),
-                    notes: update_request.notes.as_deref(),
+                    title: update_request.title.trim(),
+                    part_number: part_number.as_deref(),
+                    manufacturer: manufacturer.as_deref(),
+                    document_id: document_id.as_deref(),
+                    document_version: document_version.as_deref(),
+                    package_marking: package_marking.as_deref(),
+                    device_address: device_address.as_deref(),
+                    notes: notes.as_deref(),
                 },
             )
             .await
@@ -1199,6 +1218,14 @@ mod tests {
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].title, "Recent Document");
         assert_eq!(response.duration_ms, 25);
+    }
+
+    #[test]
+    fn test_normalize_field() {
+        assert_eq!(normalize_field(None), None);
+        assert_eq!(normalize_field(Some("")), None);
+        assert_eq!(normalize_field(Some(" \t\n ")), None);
+        assert_eq!(normalize_field(Some(" PN-1 ")), Some("PN-1".to_string()));
     }
 
     #[test]
