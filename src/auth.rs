@@ -158,9 +158,9 @@ pub fn validate_auth_key(provided_key: &str, expected_key: &str) -> bool {
 }
 
 pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IPSubnet]) -> bool {
-    // If whitelist is empty, allow all IPs
+    // An empty whitelist allows loopback only.
     if whitelist.is_empty() {
-        client_ip.is_loopback()
+        client_ip.to_canonical().is_loopback()
     } else {
         for ip_range in whitelist {
             if ip_range.contains(&client_ip) {
@@ -372,6 +372,12 @@ mod test_auth {
         ));
         assert!(!is_ip_whitelisted(
             IpAddr::from_str("192.168.1.2").unwrap(),
+            &[]
+        ));
+
+        // A dual-stack socket reports IPv4 loopback as a mapped address.
+        assert!(is_ip_whitelisted(
+            IpAddr::from_str("::ffff:127.0.0.1").unwrap(),
             &[]
         ));
     }
