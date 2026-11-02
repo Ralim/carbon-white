@@ -1,8 +1,8 @@
 use axum::{
     Router,
     extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State, multipart::Field},
-    http::{HeaderMap, StatusCode},
-    response::Json,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json, Response},
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,11 @@ use crate::{
     AppState,
     auth::{
         AuthRequest, AuthResponse, create_jwt_token_with_secret, extract_token_from_headers,
-        get_client_ip, is_ip_whitelisted, validate_auth_key, verify_jwt_token_with_secret,
+        is_ip_whitelisted, is_request_authenticated, resolve_client_ip, validate_auth_key,
+        verify_jwt_token_with_secret,
     },
     database::{self, NewDocument},
+    rate_limit::Attempt,
     shared::AuthStatusResponse,
 };
 
@@ -62,6 +64,15 @@ pub struct SubmitResponse {
 /// Upper bound on a stored filename. Leaves headroom under the common 255-byte
 /// filesystem limit
 const MAX_FILENAME_LEN: usize = 200;
+
+/// Trims a metadata value and maps blank input to `None`, so an omitted field
+/// and an empty one are both stored as NULL.
+fn normalize_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
 
 /// Reduces a client-supplied upload filename to a single safe path component.
 fn sanitize_upload_filename(raw: &str) -> String {
@@ -136,54 +147,81 @@ pub fn create_api_routes() -> Router<AppState> {
         .route("/document/{sha256}", put(handle_update_document))
 }
 
+/// Builds a failed login response.
+fn auth_failure(message: impl Into<String>) -> Json<AuthResponse> {
+    Json(AuthResponse {
+        success: false,
+        message: message.into(),
+        token: None,
+    })
+}
+
+/// A `429` telling the client how long its ban has left.
+fn auth_banned(retry_after: std::time::Duration) -> Response {
+    let hours = retry_after.as_secs().div_ceil(3600).max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::RETRY_AFTER,
+            retry_after.as_secs().max(1).to_string(),
+        )],
+        auth_failure(format!(
+            "Too many failed login attempts. Try again in about {hours} hour(s)."
+        )),
+    )
+        .into_response()
+}
+
 pub async fn handle_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<AuthRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    let client_ip = get_client_ip(&headers, Some(addr));
+) -> Result<Response, StatusCode> {
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state.trusted_proxies);
     info!("Authentication attempt from {:?}", client_ip);
 
-    // Check IP whitelist if configured
-    // Get client IP from headers with fallback to connection info
-
-    match client_ip {
+    let ip = match client_ip {
         Some(ip) => {
             if !is_ip_whitelisted(ip, &state.whitelist_ips) {
                 warn!("Authentication attempt from non-whitelisted IP: {}", ip);
-                return Ok(Json(AuthResponse {
-                    success: false,
-                    message: "Access denied from this IP address".to_string(),
-                    token: None,
-                }));
+                return Ok(auth_failure("Access denied from this IP address").into_response());
             }
             info!("IP {} is whitelisted", ip);
+            ip
         }
         None => {
             warn!(
-                "Could not determine client IP for authentication (checked headers and connection info)"
+                "Could not determine client IP for authentication (malformed forwarding headers from a trusted proxy)"
             );
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "Could not verify IP address".to_string(),
-                token: None,
-            }));
+            return Ok(auth_failure("Could not verify IP address").into_response());
+        }
+    };
+
+    let attempt = state
+        .login_limiter
+        .attempt(ip, || validate_auth_key(&request.auth_key, &state.auth_key));
+    match attempt {
+        Attempt::Succeeded => {}
+        Attempt::Failed { remaining } => {
+            warn!(
+                "Invalid auth key provided from {} ({} attempt(s) left)",
+                ip, remaining
+            );
+            return Ok(auth_failure("Invalid authentication key").into_response());
+        }
+        Attempt::Banned { retry_after } => {
+            warn!(
+                "Login from {} refused: banned for another {}s",
+                ip,
+                retry_after.as_secs()
+            );
+            return Ok(auth_banned(retry_after));
         }
     }
 
-    // Validate auth key
-    if !validate_auth_key(&request.auth_key, &state.auth_key) {
-        warn!("Invalid auth key provided");
-        return Ok(Json(AuthResponse {
-            success: false,
-            message: "Invalid authentication key".to_string(),
-            token: None,
-        }));
-    }
-
     // Generate JWT token
-    match create_jwt_token_with_secret(state.auth_key.as_bytes()) {
+    match create_jwt_token_with_secret(&state.signing_key) {
         Ok(token) => {
             info!("Authentication successful, token generated");
 
@@ -191,7 +229,8 @@ pub async fn handle_auth(
                 success: true,
                 message: "Authentication successful".to_string(),
                 token: Some(token),
-            }))
+            })
+            .into_response())
         }
         Err(e) => {
             error!("Failed to create JWT token: {}", e);
@@ -204,9 +243,7 @@ pub async fn handle_auth_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, StatusCode> {
-    let authenticated = extract_token_from_headers(&headers)
-        .map(|token| verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token).is_ok())
-        .unwrap_or(false);
+    let authenticated = authenticate_request(&headers, &state);
 
     Ok(Json(AuthStatusResponse { authenticated }))
 }
@@ -343,6 +380,45 @@ pub async fn handle_list(
     }
 }
 
+/// A file in the staging directory that is deleted when dropped, unless it was
+/// moved into place with [`StagedFile::persist`].
+///
+/// Dropping covers every early return as well as a client disconnect, which
+/// cancels the handler future mid-upload.
+struct StagedFile {
+    path: Option<PathBuf>,
+}
+
+impl StagedFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("path is only taken on persist or drop")
+    }
+
+    /// Moves the file to `destination`. On failure the staged file is removed.
+    async fn persist(mut self, destination: &Path) -> std::io::Result<()> {
+        tokio::fs::rename(self.path(), destination).await?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take()
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Could not remove staged upload {}: {}", path.display(), e);
+        }
+    }
+}
+
 /// A streamed upload that has been written and hashed but not yet committed to
 /// its final path.
 ///
@@ -350,7 +426,7 @@ pub async fn handle_list(
 /// derived from the content hash, which is not known until the upload has been
 /// read to the end.
 struct PendingUpload {
-    temp_path: PathBuf,
+    staged: StagedFile,
     original_filename: String,
     sha256: String,
 }
@@ -382,9 +458,11 @@ async fn stream_file_to_temp(
     })?;
 
     // The temporary name is random so simultaneous uploads cannot collide.
-    let temp_path = incoming.join(format!("{}.part", uuid::Uuid::new_v4()));
-    let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-        UploadError::Storage(format!("failed to create {}: {e}", temp_path.display()))
+    // The guard is declared before the handle: locals drop in reverse order,
+    // so the handle is closed before the guard deletes the file.
+    let staged = StagedFile::new(incoming.join(format!("{}.part", uuid::Uuid::new_v4())));
+    let mut file = tokio::fs::File::create(staged.path()).await.map_err(|e| {
+        UploadError::Storage(format!("failed to create {}: {e}", staged.path().display()))
     })?;
 
     let mut hasher = Sha256::new();
@@ -396,19 +474,17 @@ async fn stream_file_to_temp(
         total += chunk.len();
         if total > crate::MAX_UPLOAD_SIZE {
             // Stop reading immediately rather than draining the rest.
-            drop(file);
-            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(UploadError::TooLarge);
         }
 
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| {
-            UploadError::Storage(format!("failed to write {}: {e}", temp_path.display()))
+            UploadError::Storage(format!("failed to write {}: {e}", staged.path().display()))
         })?;
     }
 
     file.flush().await.map_err(|e| {
-        UploadError::Storage(format!("failed to flush {}: {e}", temp_path.display()))
+        UploadError::Storage(format!("failed to flush {}: {e}", staged.path().display()))
     })?;
     // The handle must be closed before the file is moved into place, otherwise
     // the rename races with the last write on some platforms.
@@ -417,7 +493,7 @@ async fn stream_file_to_temp(
     info!("File data size: {} bytes", total);
 
     Ok(PendingUpload {
-        temp_path,
+        staged,
         original_filename: filename.to_string(),
         sha256: hex::encode(hasher.finalize()),
     })
@@ -467,7 +543,7 @@ pub async fn handle_submit(
         }
     };
 
-    if let Err(e) = verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token) {
+    if let Err(e) = verify_jwt_token_with_secret(&state.signing_key, token) {
         warn!("Invalid token for file submission: {}", e);
         return Ok(Json(SubmitResponse {
             success: false,
@@ -494,11 +570,9 @@ pub async fn handle_submit(
                 filename, content_type
             );
 
-            // A second file part would leave the first one's staged bytes
-            // unreachable, so discard them before overwriting the handle.
-            if let Some(previous) = uploaded.take() {
-                let _ = tokio::fs::remove_file(&previous.temp_path).await;
-            }
+            // A second file part replaces the first; dropping the previous
+            // upload deletes its staged bytes.
+            drop(uploaded.take());
 
             uploaded = match stream_file_to_temp(&mut field, &state.data_dir, &filename).await {
                 Ok(pending) => Some(pending),
@@ -506,7 +580,7 @@ pub async fn handle_submit(
                     return Ok(Json(SubmitResponse {
                         success: false,
                         message: format!(
-                            "File size exceeds {}MB limit",
+                            "File size exceeds {} MiB limit",
                             crate::MAX_UPLOAD_SIZE / (1024 * 1024)
                         ),
                         file_sha256: None,
@@ -530,12 +604,10 @@ pub async fn handle_submit(
         }
     }
 
-    // Validate required fields
+    // Every early return from here drops `uploaded`, which deletes the staged
+    // bytes.
     let title = form_data.get("title").cloned().unwrap_or_default();
     if title.trim().is_empty() {
-        if let Some(pending) = &uploaded {
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
-        }
         return Ok(Json(SubmitResponse {
             success: false,
             message: "Title is required".to_string(),
@@ -562,98 +634,79 @@ pub async fn handle_submit(
         original_filename, file_hash
     );
 
-    // The bytes are already staged at this point, so a duplicate or a failed
-    // insert has to remove the staged copy. The final path is only chosen once
-    // the dedup check has passed.
-    match database::document_exists_by_sha256(&state.database, &file_hash).await {
-        Ok(true) => {
+    // The uploaded name is attacker controlled, so only ever use the sanitized
+    // basename for the on-disk path. The raw name is kept in the database for
+    // display only. The database holds the path relative to the data directory.
+    let stored_path = format!(
+        "files/{file_hash}/{}",
+        sanitize_upload_filename(&original_filename)
+    );
+    let file_path = Path::new(&state.data_dir).join(&stored_path);
+    let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
+
+    // The row is inserted before the file is moved. The unique hash makes the
+    // insert the arbiter between concurrent uploads of the same bytes: only the
+    // winner ever writes the final path, so a losing duplicate cannot delete or
+    // replace the stored copy. It only discards its own staged bytes.
+    let storage_date = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let field = |name: &str| normalize_field(form_data.get(name).map(String::as_str));
+    let title = title.trim().to_string();
+    let new_document = NewDocument {
+        title: title.clone(),
+        part_number: field("part_number"),
+        manufacturer: field("manufacturer"),
+        document_id: field("document_id"),
+        document_version: field("document_version"),
+        package_marking: field("package_marking"),
+        device_address: field("device_address"),
+        notes: field("notes"),
+        storage_date,
+        original_file_name: original_filename,
+        file_sha256: file_hash.clone(),
+        file_path: stored_path,
+    };
+
+    let id = match database::insert_document_if_absent(&state.database, new_document).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
             warn!("Rejected duplicate upload: {}", file_hash);
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
             return Ok(Json(SubmitResponse {
                 success: false,
                 message: "This file has already been uploaded.".to_string(),
                 file_sha256: Some(file_hash),
             }));
         }
-        Ok(false) => {}
         Err(e) => {
-            error!("Failed to check for an existing document: {}", e);
-            let _ = tokio::fs::remove_file(&pending.temp_path).await;
+            error!("Failed to store document in database: {}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-    }
-
-    // Create file storage directory
-    let file_dir = Path::new(&state.data_dir).join("files").join(&file_hash);
-
-    if let Err(e) = std::fs::create_dir_all(&file_dir) {
-        error!("Failed to create file directory: {}", e);
-        let _ = tokio::fs::remove_file(&pending.temp_path).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // The uploaded name is attacker controlled, so only ever use the sanitized
-    // basename for the on-disk path. The raw name is kept in the database for
-    // display only.
-    let stored_filename = sanitize_upload_filename(&original_filename);
-    let file_path = file_dir.join(&stored_filename);
+    };
 
     // Both paths live under the data directory, so the rename stays on one
     // filesystem and the bytes are never copied a second time.
-    if let Err(e) = tokio::fs::rename(&pending.temp_path, &file_path).await {
+    let moved = match tokio::fs::create_dir_all(&file_dir).await {
+        Ok(()) => pending.staged.persist(&file_path).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = moved {
         error!(
             "Failed to move upload into place at {}: {}",
             file_path.display(),
             e
         );
-        let _ = tokio::fs::remove_file(&pending.temp_path).await;
+        // Without its file the row would only ever serve a 404.
+        if let Err(e) = database::delete_document_by_id(&state.database, id).await {
+            error!("Failed to roll back document {}: {}", id, e);
+        }
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Create database record
-    let storage_date = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let new_document = NewDocument {
-        title: title.clone(),
-        part_number: form_data.get("part_number").cloned(),
-        manufacturer: form_data.get("manufacturer").cloned(),
-        document_id: form_data.get("document_id").cloned(),
-        document_version: form_data.get("document_version").cloned(),
-        package_marking: form_data.get("package_marking").cloned(),
-        device_address: form_data.get("device_address").cloned(),
-        notes: form_data.get("notes").cloned(),
-        storage_date,
-        original_file_name: original_filename,
-        file_sha256: file_hash.clone(),
-        file_path: file_path.to_string_lossy().to_string(),
-    };
-
-    match database::insert_document_if_absent(&state.database, new_document).await {
-        Ok(Some(id)) => {
-            info!("Document {} stored successfully with ID: {}", title, id);
-            Ok(Json(SubmitResponse {
-                success: true,
-                message: "Document uploaded successfully".to_string(),
-                file_sha256: Some(file_hash),
-            }))
-        }
-        // Lost a race against a concurrent upload of the same file. Drop the
-        // bytes we just wrote so the stored copy is not duplicated on disk.
-        Ok(None) => {
-            warn!("Duplicate upload rejected during insert: {}", file_hash);
-            let _ = tokio::fs::remove_file(&file_path).await;
-            Ok(Json(SubmitResponse {
-                success: false,
-                message: "This file has already been uploaded.".to_string(),
-                file_sha256: Some(file_hash),
-            }))
-        }
-        Err(e) => {
-            error!("Failed to store document in database: {}", e);
-            // Clean up the file if database insertion fails
-            let _ = tokio::fs::remove_file(&file_path).await;
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+    info!("Document {} stored successfully with ID: {}", title, id);
+    Ok(Json(SubmitResponse {
+        success: true,
+        message: "Document uploaded successfully".to_string(),
+        file_sha256: Some(file_hash),
+    }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -688,7 +741,16 @@ pub struct DocumentResponse {
     pub storage_date: String,
     pub original_file_name: String,
     pub file_sha256: String,
-    pub file_path: String,
+    /// Name of the stored file. The server-side path is never exposed.
+    pub file_name: String,
+}
+
+/// The final component of a stored path.
+fn stored_file_name(file_path: &str) -> String {
+    Path::new(file_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub async fn handle_get_document(
@@ -726,8 +788,8 @@ pub async fn handle_get_document(
                 notes: document.notes,
                 storage_date: document.storage_date,
                 original_file_name: document.original_file_name,
+                file_name: stored_file_name(&document.file_path),
                 file_sha256: document.file_sha256,
-                file_path: document.file_path,
             }))
         }
         Ok(None) => {
@@ -773,19 +835,27 @@ pub async fn handle_update_document(
     // Check if document exists
     match database::get_document_by_sha256(&state.database, &sha256).await {
         Ok(Some(_existing_doc)) => {
+            let part_number = normalize_field(update_request.part_number.as_deref());
+            let manufacturer = normalize_field(update_request.manufacturer.as_deref());
+            let document_id = normalize_field(update_request.document_id.as_deref());
+            let document_version = normalize_field(update_request.document_version.as_deref());
+            let package_marking = normalize_field(update_request.package_marking.as_deref());
+            let device_address = normalize_field(update_request.device_address.as_deref());
+            let notes = normalize_field(update_request.notes.as_deref());
+
             // Update the document
             match database::update_document_metadata(
                 &state.database,
                 &sha256,
                 &database::DocumentMetadataUpdate {
-                    title: &update_request.title,
-                    part_number: update_request.part_number.as_deref(),
-                    manufacturer: update_request.manufacturer.as_deref(),
-                    document_id: update_request.document_id.as_deref(),
-                    document_version: update_request.document_version.as_deref(),
-                    package_marking: update_request.package_marking.as_deref(),
-                    device_address: update_request.device_address.as_deref(),
-                    notes: update_request.notes.as_deref(),
+                    title: update_request.title.trim(),
+                    part_number: part_number.as_deref(),
+                    manufacturer: manufacturer.as_deref(),
+                    document_id: document_id.as_deref(),
+                    document_version: document_version.as_deref(),
+                    package_marking: package_marking.as_deref(),
+                    device_address: device_address.as_deref(),
+                    notes: notes.as_deref(),
                 },
             )
             .await
@@ -817,17 +887,9 @@ pub async fn handle_update_document(
     }
 }
 
-/// Checks the bearer token on a request against the configured auth key.
-///
-/// Returns `true` only when a well-formed `Authorization: Bearer <token>` header
-/// carries a token that verifies and has not expired.
+/// Checks the bearer token on a request against the session signing key.
 fn authenticate_request(headers: &HeaderMap, state: &AppState) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| verify_jwt_token_with_secret(state.auth_key.as_bytes(), token).is_ok())
-        .unwrap_or(false)
+    is_request_authenticated(headers, &state.signing_key)
 }
 
 #[cfg(test)]
@@ -838,40 +900,52 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
-    fn test_ip_whitelist_with_headers() {
-        // Whitelist contains 192.168.1.1
+    fn test_ip_whitelist_with_trusted_proxy_headers() {
         let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let trusted = vec![IPSubnet::try_from("127.0.0.1").unwrap()];
+        let proxy = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-        // X-Forwarded-For header present
+        // X-Forwarded-For from a trusted proxy
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1"));
-        let ip = get_client_ip(&headers, connect_info);
+        let ip = resolve_client_ip(&headers, proxy, &trusted);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
 
-        // X-Real-IP header present
+        // X-Real-IP from a trusted proxy
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.1"));
-        let ip = get_client_ip(&headers, connect_info);
+        let ip = resolve_client_ip(&headers, proxy, &trusted);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(is_ip_whitelisted(ip.unwrap(), &whitelist));
 
         // Not whitelisted
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
-        let ip = get_client_ip(&headers, connect_info);
+        let ip = resolve_client_ip(&headers, proxy, &trusted);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(!is_ip_whitelisted(ip.unwrap(), &whitelist));
     }
 
     #[test]
+    fn test_ip_whitelist_spoofed_header_without_trusted_proxy() {
+        // A directly connected client claiming to be whitelisted is judged on
+        // its socket address alone.
+        let whitelist = vec![IPSubnet::try_from("192.168.1.1/32").unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.1"));
+        let ip = resolve_client_ip(&headers, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), &[]);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_ip_whitelisted(ip.unwrap(), &whitelist));
+    }
+
+    #[test]
     fn test_ip_whitelist_with_connect_info_fallback() {
-        // Simulate no headers, fallback to ConnectInfo
+        // Simulate no headers, fallback to the socket peer
         let whitelist = vec![IPSubnet::try_from("127.0.0.1/32").unwrap()];
         let headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
-        let client_ip = get_client_ip(&headers, connect_info);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        let client_ip = resolve_client_ip(&headers, peer.ip(), &[]);
         assert_eq!(client_ip, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert!(is_ip_whitelisted(client_ip.unwrap(), &whitelist));
     }
@@ -915,6 +989,41 @@ mod tests {
 
         assert_eq!(response.results.len(), 0);
         assert_eq!(response.duration_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn test_staged_file_is_removed_on_drop_unless_persisted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let dropped = temp_dir.path().join("dropped.part");
+        std::fs::write(&dropped, b"bytes").unwrap();
+        drop(StagedFile::new(dropped.clone()));
+        assert!(!dropped.exists());
+
+        let kept = temp_dir.path().join("kept.part");
+        let destination = temp_dir.path().join("final.pdf");
+        std::fs::write(&kept, b"bytes").unwrap();
+        StagedFile::new(kept.clone())
+            .persist(&destination)
+            .await
+            .unwrap();
+        assert!(!kept.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"bytes");
+
+        // A failed move still cleans up.
+        let failed = temp_dir.path().join("failed.part");
+        std::fs::write(&failed, b"bytes").unwrap();
+        let missing_dir = temp_dir.path().join("missing").join("final.pdf");
+        assert!(
+            StagedFile::new(failed.clone())
+                .persist(&missing_dir)
+                .await
+                .is_err()
+        );
+        assert!(!failed.exists());
+
+        // A file that was never created is not an error.
+        drop(StagedFile::new(temp_dir.path().join("never-created.part")));
     }
 
     #[tokio::test]
@@ -1071,12 +1180,12 @@ mod tests {
     fn test_submit_response_file_too_large() {
         let response = SubmitResponse {
             success: false,
-            message: "File size exceeds 100MB limit".to_string(),
+            message: "File size exceeds 250 MiB limit".to_string(),
             file_sha256: None,
         };
 
         assert!(!response.success);
-        assert_eq!(response.message, "File size exceeds 100MB limit");
+        assert_eq!(response.message, "File size exceeds 250 MiB limit");
         assert!(response.file_sha256.is_none());
     }
 
@@ -1113,6 +1222,14 @@ mod tests {
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].title, "Recent Document");
         assert_eq!(response.duration_ms, 25);
+    }
+
+    #[test]
+    fn test_normalize_field() {
+        assert_eq!(normalize_field(None), None);
+        assert_eq!(normalize_field(Some("")), None);
+        assert_eq!(normalize_field(Some(" \t\n ")), None);
+        assert_eq!(normalize_field(Some(" PN-1 ")), Some("PN-1".to_string()));
     }
 
     #[test]

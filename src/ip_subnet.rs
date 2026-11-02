@@ -42,9 +42,12 @@ impl fmt::Display for IPSubnet {
     }
 }
 impl IPSubnet {
-    // Test if the given IP address is within this subnet
+    /// Tests whether `ip` is within this subnet.
+    ///
+    /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`), which is how a dual-stack
+    /// socket reports IPv4 peers, are matched as the IPv4 address they carry.
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        match (self.ip_address, ip) {
+        match (self.ip_address, ip.to_canonical()) {
             (IpAddr::V4(subnet_ip), IpAddr::V4(target_ip)) => {
                 let mask_len = self.mask;
                 if mask_len == 0 {
@@ -52,7 +55,7 @@ impl IPSubnet {
                 }
 
                 let mask = u32::MAX.checked_shl(32 - mask_len as u32).unwrap_or(0);
-                (u32::from(subnet_ip) & mask) == (u32::from(*target_ip) & mask)
+                (u32::from(subnet_ip) & mask) == (u32::from(target_ip) & mask)
             }
             (IpAddr::V6(subnet_ip), IpAddr::V6(target_ip)) => {
                 let mask_len = self.mask;
@@ -61,7 +64,7 @@ impl IPSubnet {
                 }
 
                 let mask = u128::MAX.checked_shl(128 - mask_len as u32).unwrap_or(0);
-                (u128::from(subnet_ip) & mask) == (u128::from(*target_ip) & mask)
+                (u128::from(subnet_ip) & mask) == (u128::from(target_ip) & mask)
             }
             // Mismatched IP versions (IPv4 vs IPv6)
             _ => false,
@@ -100,6 +103,10 @@ impl TryFrom<&str> for IPSubnet {
     type Error = ParseIPSubnetError;
 
     /// Try and parse given IP's like 192.168.0.0/24 or 192.168.0.10 or FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF/128 etc
+    ///
+    /// A bare address is a single host (`/32` or `/128`, by address family).
+    /// IPv4-mapped IPv6 subnets of `/96` or longer are stored as the IPv4
+    /// subnet they describe.
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let value = value.trim();
         if value.is_empty() {
@@ -107,16 +114,11 @@ impl TryFrom<&str> for IPSubnet {
         }
 
         let (ip_str, mask_str) = match value.split_once('/') {
-            Some((ip, mask)) => (ip, mask),
-            None if value.contains('.') => (value, "32"),
-            None => (value, "128"),
+            Some((ip, mask)) => (ip, Some(mask)),
+            None => (value, None),
         };
 
         let ip_address: IpAddr = ip_str.parse().map_err(|_| ParseIPSubnetError::InvalidIp)?;
-
-        let mask: u8 = mask_str
-            .parse()
-            .map_err(|_| ParseIPSubnetError::InvalidMask)?;
 
         // Validate mask limits based on IP version
         let max_mask = match ip_address {
@@ -124,8 +126,23 @@ impl TryFrom<&str> for IPSubnet {
             IpAddr::V6(_) => 128,
         };
 
+        let mask: u8 = match mask_str {
+            Some(mask) => mask.parse().map_err(|_| ParseIPSubnetError::InvalidMask)?,
+            None => max_mask,
+        };
+
         if mask > max_mask {
             return Err(ParseIPSubnetError::InvalidMask);
+        }
+
+        if let IpAddr::V6(v6) = ip_address
+            && let Some(v4) = v6.to_ipv4_mapped()
+            && mask >= 96
+        {
+            return Ok(IPSubnet {
+                ip_address: IpAddr::V4(v4),
+                mask: mask - 96,
+            });
         }
 
         Ok(IPSubnet { ip_address, mask })
@@ -250,5 +267,36 @@ mod test_ip_subnet {
         assert_eq!(subnet.ip_address(), IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0)));
         assert_eq!(subnet.prefix_len(), 24);
         assert!(!subnet.is_default_route());
+    }
+
+    #[test]
+    fn test_bare_mapped_address_is_a_single_host() {
+        // The dot in `::ffff:a.b.c.d` must not select an IPv4-sized prefix; as
+        // an IPv6 /32 it would cover `::1` and every mapped IPv4 address.
+        let subnet = IPSubnet::try_from("::ffff:10.0.0.1").unwrap();
+        assert_eq!(subnet, IPSubnet::try_from("10.0.0.1").unwrap());
+        assert!(subnet.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!subnet.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert!(!subnet.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!subnet.contains(&IpAddr::from_str("::ffff:192.168.1.1").unwrap()));
+    }
+
+    #[test]
+    fn test_mapped_subnets_become_ipv4() {
+        let subnet = IPSubnet::try_from("::ffff:192.168.0.0/120").unwrap();
+        assert_eq!(subnet, IPSubnet::try_from("192.168.0.0/24").unwrap());
+
+        // Shorter than /96 reaches outside the mapped range, so it stays IPv6.
+        let wide = IPSubnet::try_from("::ffff:0.0.0.0/80").unwrap();
+        assert_eq!(wide.prefix_len(), 80);
+        assert!(matches!(wide.ip_address(), IpAddr::V6(_)));
+    }
+
+    #[test]
+    fn test_ipv4_subnet_matches_mapped_peers() {
+        // A dual-stack listener reports IPv4 clients as `::ffff:a.b.c.d`.
+        let subnet = IPSubnet::try_from("192.168.0.0/24").unwrap();
+        assert!(subnet.contains(&IpAddr::from_str("::ffff:192.168.0.9").unwrap()));
+        assert!(!subnet.contains(&IpAddr::from_str("::ffff:192.168.1.9").unwrap()));
     }
 }

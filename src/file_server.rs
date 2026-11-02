@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Path, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::get,
 };
@@ -17,9 +17,21 @@ pub fn create_file_routes() -> Router<AppState> {
     Router::new().route("/{sha256}", get(serve_file))
 }
 
+/// Request headers `ServeFile` uses for partial and conditional responses.
+const FORWARDED_HEADERS: [header::HeaderName; 6] = [
+    header::RANGE,
+    header::IF_RANGE,
+    header::IF_MATCH,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_UNMODIFIED_SINCE,
+];
+
 pub async fn serve_file(
     State(state): State<AppState>,
     Path(sha256): Path<String>,
+    method: Method,
+    request_headers: HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
     info!("File request for SHA256: {}", sha256);
 
@@ -42,71 +54,177 @@ pub async fn serve_file(
         }
     };
 
-    // Stream the file from disk including resume
-    let request = axum::http::Request::builder()
-        .uri("/")
-        .body(Body::empty())
-        .map_err(|e| {
-            error!("Failed to build file request: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Stream the file from disk. Range and validator headers are passed through
+    // so downloads can resume and cached copies revalidate with a 304.
+    let mut file_request = axum::http::Request::builder().method(method).uri("/");
+    for name in FORWARDED_HEADERS {
+        for value in request_headers.get_all(&name) {
+            file_request = file_request.header(&name, value);
+        }
+    }
+    let request = file_request.body(Body::empty()).map_err(|e| {
+        error!("Failed to build file request: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let mut response = ServeFile::new(&document.file_path)
+    let Some(file_path) = database::resolve_file_path(&state.data_dir, &document.file_path) else {
+        error!(
+            "Refusing to serve document {} from unsafe path `{}`",
+            sha256, document.file_path
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    let mut response = ServeFile::new(&file_path)
         .oneshot(request)
         .await
         .map_err(|e| {
-            error!("Failed to serve file {}: {}", document.file_path, e);
+            error!("Failed to serve file {}: {}", file_path.display(), e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Missing file
     if response.status() == StatusCode::NOT_FOUND {
-        error!("File not found on disk: {}", document.file_path);
+        error!("File not found on disk: {}", file_path.display());
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Determine MIME type. The recorded original name is preferred over the
-    // stored one.
-    let mime_type = MimeGuess::from_path(&document.original_file_name)
-        .first_or_octet_stream()
-        .to_string();
-    if let Ok(value) = HeaderValue::from_str(&mime_type) {
-        response.headers_mut().insert(header::CONTENT_TYPE, value);
-    }
-
-    // Set Content-Disposition to inline so files open in browser instead of
-    // downloading.
-    response.headers_mut().insert(
+    // Uploads are attacker controlled and served from the app's origin, so
+    // only types a browser renders passively are shown inline.
+    let presentation = Presentation::for_filename(&document.original_file_name);
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, presentation.content_type);
+    headers.insert(
         header::CONTENT_DISPOSITION,
-        content_disposition_header(&document.original_file_name),
+        content_disposition_header(presentation.disposition, &document.original_file_name),
     );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Some(policy) = presentation.content_security_policy {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(policy),
+        );
+    }
 
     // Add cache control headers. The on-disk path is derived from the content
     // hash, so a given URL always maps to the same bytes so crank to Firefox max.
-    response.headers_mut().insert(
+    headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=86400"),
     );
 
     info!(
         "Serving file: {} ({})",
-        document.original_file_name, document.file_path
+        document.original_file_name,
+        file_path.display()
     );
 
     Ok(response.map(Body::new))
 }
 
+/// Whether the browser should display a file or download it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Inline,
+    Attachment,
+}
+
+impl Disposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Attachment => "attachment",
+        }
+    }
+}
+
+/// Policy for passive inline content: no scripts, no plugins, no network
+/// access beyond the file itself, and a unique opaque origin.
+const SANDBOX_POLICY: &str =
+    "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox";
+
+/// How a stored file is presented to the browser.
+#[derive(Debug)]
+struct Presentation {
+    content_type: HeaderValue,
+    disposition: Disposition,
+    content_security_policy: Option<&'static str>,
+}
+
+impl Presentation {
+    /// Chooses headers from the uploader-supplied filename.
+    ///
+    /// The filename is untrusted, so this is an allowlist: anything that is not
+    /// known to render passively (HTML, SVG, XML, scripts, unknown types) is
+    /// downloaded as opaque bytes rather than rendered on the app origin.
+    fn for_filename(filename: &str) -> Self {
+        let mime = MimeGuess::from_path(filename).first_or_octet_stream();
+        let inline_type = match mime.essence_str() {
+            // Browser PDF viewers break under a sandbox CSP and isolate PDF
+            // scripts from the embedding origin themselves.
+            "application/pdf" => {
+                return Self {
+                    content_type: HeaderValue::from_static("application/pdf"),
+                    disposition: Disposition::Inline,
+                    content_security_policy: None,
+                };
+            }
+            "image/png" => Some("image/png"),
+            "image/jpeg" => Some("image/jpeg"),
+            "image/gif" => Some("image/gif"),
+            "image/webp" => Some("image/webp"),
+            "image/bmp" => Some("image/bmp"),
+            "image/avif" => Some("image/avif"),
+            // Text formats are shown as plain text, never interpreted.
+            "text/plain"
+            | "text/markdown"
+            | "text/x-markdown"
+            | "text/csv"
+            | "text/tab-separated-values" => Some("text/plain; charset=utf-8"),
+            _ => None,
+        };
+
+        match inline_type {
+            Some(content_type) => Self {
+                content_type: HeaderValue::from_static(content_type),
+                disposition: Disposition::Inline,
+                content_security_policy: Some(SANDBOX_POLICY),
+            },
+            None => Self {
+                content_type: HeaderValue::from_static("application/octet-stream"),
+                disposition: Disposition::Attachment,
+                content_security_policy: Some(SANDBOX_POLICY),
+            },
+        }
+    }
+}
+
 /// Builds the `Content-Disposition` value for a filename.
 ///
-/// Header values are restricted to visible ASCII, so a filename containing
-/// non-ASCII characters cannot be placed in the header as written. Rather than
-/// failing the response, fall back to a bare `inline`.
-fn content_disposition_header(filename: &str) -> HeaderValue {
+/// Header values are restricted to visible ASCII, so the quoted `filename`
+/// carries an ASCII approximation and `filename*` (RFC 6266) carries the exact
+/// UTF-8 name for browsers that support it.
+fn content_disposition_header(disposition: Disposition, filename: &str) -> HeaderValue {
     let sanitized = sanitize_filename(filename);
-    match HeaderValue::from_str(&format!("inline; filename=\"{sanitized}\"")) {
-        Ok(value) if value.to_str().is_ok() => value,
-        _ => HeaderValue::from_static("inline"),
-    }
+    let ascii: String = sanitized
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect();
+
+    let value = if ascii == sanitized {
+        format!("{}; filename=\"{ascii}\"", disposition.as_str())
+    } else {
+        format!(
+            "{}; filename=\"{ascii}\"; filename*=UTF-8''{}",
+            disposition.as_str(),
+            urlencoding::encode(&sanitized)
+        )
+    };
+
+    HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("attachment"))
 }
 
 fn is_valid_sha256(input: &str) -> bool {
@@ -135,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_content_disposition_header_plain_filename() {
-        let value = content_disposition_header("datasheet.pdf");
+        let value = content_disposition_header(Disposition::Inline, "datasheet.pdf");
         assert_eq!(
             value.to_str().unwrap(),
             "inline; filename=\"datasheet.pdf\""
@@ -146,17 +264,258 @@ mod tests {
     fn test_content_disposition_header_sanitizes_quotes() {
         // An embedded quote would otherwise terminate the filename early and
         // let a caller inject additional header parameters.
-        let value = content_disposition_header("we\"ird.pdf");
-        assert_eq!(value.to_str().unwrap(), "inline; filename=\"we_ird.pdf\"");
+        let value = content_disposition_header(Disposition::Attachment, "we\"ird.pdf");
+        assert_eq!(
+            value.to_str().unwrap(),
+            "attachment; filename=\"we_ird.pdf\""
+        );
     }
 
     #[test]
-    fn test_content_disposition_header_falls_back_for_non_ascii() {
-        // Header values are visible-ASCII only. The previous implementation
-        // called `.unwrap()` on the parse, so a filename like this panicked
-        // the request handler instead of serving the file.
-        let value = content_disposition_header("файл.pdf");
-        assert_eq!(value.to_str().unwrap(), "inline");
+    fn test_content_disposition_header_encodes_non_ascii() {
+        // Header values are visible-ASCII only, so the exact name travels in
+        // the percent-encoded `filename*` parameter.
+        let value = content_disposition_header(Disposition::Inline, "файл.pdf");
+        assert_eq!(
+            value.to_str().unwrap(),
+            "inline; filename=\"____.pdf\"; filename*=UTF-8''%D1%84%D0%B0%D0%B9%D0%BB.pdf"
+        );
+    }
+
+    #[test]
+    fn test_presentation_allows_passive_types_inline() {
+        let pdf = Presentation::for_filename("datasheet.PDF");
+        assert_eq!(pdf.content_type, "application/pdf");
+        assert_eq!(pdf.disposition, Disposition::Inline);
+        assert_eq!(pdf.content_security_policy, None);
+
+        let png = Presentation::for_filename("pinout.png");
+        assert_eq!(png.content_type, "image/png");
+        assert_eq!(png.disposition, Disposition::Inline);
+        assert_eq!(png.content_security_policy, Some(SANDBOX_POLICY));
+
+        for name in ["notes.txt", "readme.md", "table.csv"] {
+            let text = Presentation::for_filename(name);
+            assert_eq!(text.content_type, "text/plain; charset=utf-8", "{name}");
+            assert_eq!(text.disposition, Disposition::Inline, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_presentation_downloads_active_and_unknown_types() {
+        for name in [
+            "evil.html",
+            "evil.htm",
+            "evil.xhtml",
+            "evil.svg",
+            "evil.xml",
+            "evil.js",
+            "firmware.bin",
+            "archive.zip",
+            "no_extension",
+        ] {
+            let presentation = Presentation::for_filename(name);
+            assert_eq!(
+                presentation.content_type, "application/octet-stream",
+                "{name}"
+            );
+            assert_eq!(presentation.disposition, Disposition::Attachment, "{name}");
+            assert_eq!(
+                presentation.content_security_policy,
+                Some(SANDBOX_POLICY),
+                "{name}"
+            );
+        }
+    }
+
+    /// Stores `contents` as `name` and returns a router serving it plus its hash.
+    async fn router_with_file(name: &str, contents: &[u8]) -> (Router, String, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap().to_string();
+        let pool = crate::database::init_db(&data_dir).await.unwrap();
+
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(contents));
+        let file_dir = std::path::Path::new(&data_dir).join("files").join(&sha);
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let file_path = file_dir.join(name);
+        std::fs::write(&file_path, contents).unwrap();
+
+        crate::database::insert_document_if_absent(
+            &pool,
+            crate::database::NewDocument {
+                title: name.to_string(),
+                part_number: None,
+                manufacturer: None,
+                document_id: None,
+                document_version: None,
+                package_marking: None,
+                device_address: None,
+                notes: None,
+                storage_date: "2024-01-01".to_string(),
+                original_file_name: name.to_string(),
+                file_sha256: sha.clone(),
+                file_path: format!("files/{sha}/{name}"),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("document should insert");
+
+        let state = AppState::new(pool, data_dir, "test-key");
+        (create_file_routes().with_state(state), sha, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_refuses_paths_outside_data_dir() {
+        use axum::http::Request;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(temp_dir.path().join("outside.txt"), b"secret").unwrap();
+        let data_dir = data_dir.to_str().unwrap().to_string();
+        let pool = crate::database::init_db(&data_dir).await.unwrap();
+
+        let sha = "d".repeat(64);
+        crate::database::insert_document_if_absent(
+            &pool,
+            crate::database::NewDocument {
+                title: "Escape".to_string(),
+                part_number: None,
+                manufacturer: None,
+                document_id: None,
+                document_version: None,
+                package_marking: None,
+                device_address: None,
+                notes: None,
+                storage_date: "2024-01-01".to_string(),
+                original_file_name: "outside.txt".to_string(),
+                file_sha256: sha.clone(),
+                file_path: "../outside.txt".to_string(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let router = create_file_routes().with_state(AppState::new(pool, data_dir, "test-key"));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_honours_range_requests() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) = router_with_file("datasheet.pdf", b"0123456789").await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+        // The partial response is still hardened.
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"2345");
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_revalidates_with_304() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) = router_with_file("datasheet.pdf", b"cached").await;
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let last_modified = first.headers()[header::LAST_MODIFIED].clone();
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .header(header::IF_MODIFIED_SINCE, last_modified)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_head_has_no_body() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) = router_with_file("datasheet.pdf", b"0123456789").await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_downloads_html_instead_of_rendering() {
+        use axum::http::Request;
+
+        let (router, sha, _temp) =
+            router_with_file("evil.html", b"<script>alert(document.cookie)</script>").await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"evil.html\""
+        );
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], SANDBOX_POLICY);
     }
 
     #[tokio::test]
@@ -192,19 +551,14 @@ mod tests {
                 storage_date: "2024-01-01".to_string(),
                 original_file_name: "datasheet.pdf".to_string(),
                 file_sha256: sha.clone(),
-                file_path: file_path.to_string_lossy().to_string(),
+                file_path: format!("files/{sha}/datasheet.pdf"),
             },
         )
         .await
         .unwrap()
         .expect("document should insert");
 
-        let state = AppState {
-            database: pool,
-            data_dir: data_dir.to_string(),
-            auth_key: "test-key".to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(pool, data_dir, "test-key");
         let router = create_file_routes().with_state(state);
 
         let request = Request::builder()
@@ -234,12 +588,11 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().to_str().unwrap();
-        let state = AppState {
-            database: crate::database::init_db(data_dir).await.unwrap(),
-            data_dir: data_dir.to_string(),
-            auth_key: "test-key".to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(
+            crate::database::init_db(data_dir).await.unwrap(),
+            data_dir,
+            "test-key",
+        );
         let router = create_file_routes().with_state(state);
 
         let request = Request::builder()

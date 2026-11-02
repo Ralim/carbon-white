@@ -1,17 +1,29 @@
-use crate::AppState;
 use crate::ip_subnet::IPSubnet;
-use axum::{
-    extract::{Request, State},
-    http::{HeaderMap, StatusCode},
-    middleware::Next,
-    response::Response,
-};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use axum::http::HeaderMap;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::net::{IpAddr, SocketAddr};
-use tracing::{error, info, warn};
 
 const JWT_EXPIRATION_HOURS: i64 = 24;
+
+/// The only JOSE header ever issued or accepted. Fixing it means a token can
+/// never select a different algorithm, such as `none`.
+const JWT_HEADER: &str = r#"{"alg":"HS256","typ":"JWT"}"#;
+
+/// Length of the session signing key, matching the HS256 block of SHA-256 output.
+pub const SIGNING_KEY_LEN: usize = 32;
+
+/// Draws a fresh session signing key from the OS RNG.
+///
+/// The login key is never used to sign tokens, so a leaked token cannot be
+/// used to brute-force it offline.
+pub fn generate_signing_key() -> [u8; SIGNING_KEY_LEN] {
+    let mut key = [0u8; SIGNING_KEY_LEN];
+    getrandom::fill(&mut key).expect("the OS random number generator is unavailable");
+    key
+}
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct Claims {
@@ -32,7 +44,38 @@ pub struct AuthResponse {
     pub token: Option<String>,
 }
 
-pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
+/// Why a session token could not be issued or accepted.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenError {
+    #[error("token is not a well-formed HS256 JWT")]
+    Malformed,
+    #[error("token signature does not match")]
+    BadSignature,
+    #[error("token has expired")]
+    Expired,
+    #[error("failed to encode token claims: {0}")]
+    Encoding(#[from] serde_json::Error),
+}
+
+fn mac_for(secret: &[u8]) -> Hmac<Sha256> {
+    // HMAC accepts keys of any length, so this cannot fail.
+    <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length")
+}
+
+/// Encodes and signs `claims` as an HS256 JWT.
+fn sign_claims(secret: &[u8], claims: &Claims) -> Result<String, TokenError> {
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(JWT_HEADER),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?)
+    );
+    let mut mac = mac_for(secret);
+    mac.update(signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{signing_input}.{signature}"))
+}
+
+pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, TokenError> {
     let now = chrono::Utc::now();
     let exp = now + chrono::Duration::hours(JWT_EXPIRATION_HOURS);
 
@@ -42,101 +85,71 @@ pub fn create_jwt_token_with_secret(secret: &[u8]) -> Result<String, jsonwebtoke
         iat: now.timestamp() as usize,
     };
 
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret),
-    )
+    sign_claims(secret, &claims)
 }
 
-pub fn verify_jwt_token_with_secret(
-    secret: &[u8],
-    token: &str,
-) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let validation = Validation::new(Algorithm::HS256);
+/// Verifies an HS256 JWT issued by [`create_jwt_token_with_secret`].
+///
+/// The signature is checked in constant time before the payload is parsed,
+/// and a token is rejected once its `exp` has passed.
+pub fn verify_jwt_token_with_secret(secret: &[u8], token: &str) -> Result<Claims, TokenError> {
+    let mut segments = token.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(TokenError::Malformed);
+    };
 
-    decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)
-        .map(|token_data| token_data.claims)
+    let header_json: serde_json::Value = URL_SAFE_NO_PAD
+        .decode(header)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(TokenError::Malformed)?;
+    if header_json.get("alg").and_then(serde_json::Value::as_str) != Some("HS256") {
+        return Err(TokenError::Malformed);
+    }
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| TokenError::Malformed)?;
+    let mut mac = mac_for(secret);
+    mac.update(header.as_bytes());
+    mac.update(b".");
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| TokenError::BadSignature)?;
+
+    let claims: Claims = URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(TokenError::Malformed)?;
+
+    let now = chrono::Utc::now().timestamp();
+    if i64::try_from(claims.exp).map_or(true, |exp| exp <= now) {
+        return Err(TokenError::Expired);
+    }
+    Ok(claims)
 }
 
-pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    // Try to get token from Authorization header
-    if let Some(token) = headers
+/// Reads the session token from an `Authorization: Bearer` header.
+///
+/// Cookies are deliberately not accepted: the browser attaches them to
+/// cross-site requests, which would open the API to request forgery.
+pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-    {
-        return Some(token.to_string());
-    }
-
-    // Try to get token from cookie
-    headers
-        .get("cookie")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let (name, value) = cookie.trim().split_once('=')?;
-                (name.trim() == "carbon_auth_token").then(|| value.trim().to_string())
-            })
-        })
 }
 
-pub async fn auth_middleware(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    // Skip auth for public endpoints
-    let path = request.uri().path();
-    if is_public_endpoint(path) {
-        return Ok(next.run(request).await);
-    }
-
-    // Extract token from headers
-    let token = match extract_token_from_headers(&headers) {
-        Some(token) => token,
-        None => {
-            warn!("No auth token found for protected endpoint: {}", path);
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    };
-
-    // Verify token
-    match verify_jwt_token_with_secret(state.auth_key.as_bytes(), &token) {
-        Ok(claims) => {
-            info!("Valid token for user: {} accessing {}", claims.sub, path);
-            Ok(next.run(request).await)
-        }
-        Err(e) => {
-            error!("Invalid token for endpoint {}: {}", path, e);
-            Err(StatusCode::UNAUTHORIZED)
-        }
-    }
-}
-
-fn is_public_endpoint(path: &str) -> bool {
-    // Public endpoints that don't require authentication
-    let public_paths = [
-        "/",
-        "/login",
-        "/api/search",
-        "/api/auth",
-        "/file/",
-        "/pkg/",
-        "/assets/",
-    ];
-
-    public_paths.iter().any(|&public_path| {
-        if public_path == "/" {
-            // Root path should only match exactly
-            path == "/"
-        } else if public_path.ends_with('/') {
-            path.starts_with(public_path)
-        } else {
-            path == public_path
-        }
-    })
+/// True when the request carries a valid, unexpired session token.
+pub fn is_request_authenticated(headers: &HeaderMap, signing_key: &[u8]) -> bool {
+    extract_token_from_headers(headers)
+        .is_some_and(|token| verify_jwt_token_with_secret(signing_key, token).is_ok())
 }
 
 pub fn validate_auth_key(provided_key: &str, expected_key: &str) -> bool {
@@ -158,9 +171,9 @@ pub fn validate_auth_key(provided_key: &str, expected_key: &str) -> bool {
 }
 
 pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IPSubnet]) -> bool {
-    // If whitelist is empty, allow all IPs
+    // An empty whitelist allows loopback only.
     if whitelist.is_empty() {
-        client_ip.is_loopback()
+        client_ip.to_canonical().is_loopback()
     } else {
         for ip_range in whitelist {
             if ip_range.contains(&client_ip) {
@@ -171,52 +184,75 @@ pub fn is_ip_whitelisted(client_ip: IpAddr, whitelist: &[IPSubnet]) -> bool {
     }
 }
 
-pub fn get_client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
-    // Try X-Forwarded-For header first (for reverse proxies), taking the first
-    // IP in the comma-separated list.
-    if let Some(ip) = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|forwarded| forwarded.split(',').next())
-        .and_then(|first| first.trim().parse::<IpAddr>().ok())
-    {
-        return Some(ip);
-    }
-
-    // Try X-Real-IP header
-    headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|real_ip| real_ip.parse::<IpAddr>().ok())
+fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[IPSubnet]) -> bool {
+    trusted_proxies.iter().any(|proxy| proxy.contains(&ip))
 }
 
-/// Get client IP address from headers with fallback to connection info
+/// Parses one forwarded address, tolerating the `ip:port` and `[ipv6]:port`
+/// forms some proxies emit.
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    value
+        .parse::<IpAddr>()
+        .or_else(|_| value.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()
+        .map(|ip| ip.to_canonical())
+}
+
+/// Resolves the address of the client that originated a request.
 ///
-/// This function first tries to extract the client IP from headers (X-Forwarded-For, X-Real-IP)
-/// and falls back to using the connection's remote address if no IP is found in headers.
+/// The socket peer is the client unless it is listed in `trusted_proxies`.
+/// Only then are forwarding headers consulted: `X-Forwarded-For` is walked
+/// right to left, skipping trusted hops, because proxies append to it and
+/// everything left of the first untrusted hop is client supplied. `X-Real-IP` is
+/// used when no `X-Forwarded-For` is present.
 ///
-/// # Arguments
-///
-/// * `headers` - HTTP headers that may contain forwarded IP information
-/// * `connect_info` - Optional socket address from the connection
-///
-/// # Returns
-///
-/// The client's IP address if found, None otherwise
-pub fn get_client_ip(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> Option<IpAddr> {
-    // First try to get IP from headers
-    if let Some(ip) = get_client_ip_from_headers(headers) {
-        return Some(ip);
+/// Returns `None` when a trusted proxy forwarded an address that cannot be
+/// parsed, so callers fail closed rather than guessing.
+pub fn resolve_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trusted_proxies: &[IPSubnet],
+) -> Option<IpAddr> {
+    let peer = peer.to_canonical();
+    if !is_trusted_proxy(peer, trusted_proxies) {
+        return Some(peer);
     }
 
-    // Fall back to connection info if available
-    connect_info.map(|addr| addr.ip())
+    // Repeated header lines are equivalent to a single comma-joined list.
+    let mut hops = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        hops.extend(
+            value
+                .to_str()
+                .ok()?
+                .split(',')
+                .map(str::trim)
+                .filter(|hop| !hop.is_empty()),
+        );
+    }
+
+    if !hops.is_empty() {
+        let mut client = peer;
+        for hop in hops.iter().rev() {
+            client = parse_forwarded_ip(hop)?;
+            if !is_trusted_proxy(client, trusted_proxies) {
+                return Some(client);
+            }
+        }
+        // Every hop is a trusted proxy, so the left-most one originated the request.
+        return Some(client);
+    }
+
+    match headers.get("x-real-ip") {
+        Some(value) => value.to_str().ok().and_then(parse_forwarded_ip),
+        None => Some(peer),
+    }
 }
 
 #[cfg(test)]
 mod test_auth {
     use super::*;
-    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::str::FromStr;
 
     #[test]
@@ -256,14 +292,67 @@ mod test_auth {
             exp: (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize,
             iat: (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp() as usize,
         };
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret),
-        )
-        .unwrap();
+        let token = sign_claims(secret, &claims).unwrap();
 
-        assert!(verify_jwt_token_with_secret(secret, &token).is_err());
+        assert!(matches!(
+            verify_jwt_token_with_secret(secret, &token),
+            Err(TokenError::Expired)
+        ));
+    }
+
+    #[test]
+    fn test_token_is_a_standard_hs256_jwt() {
+        let token = create_jwt_token_with_secret(b"secret").unwrap();
+        let segments: Vec<&str> = token.split('.').collect();
+        assert_eq!(segments.len(), 3);
+
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(segments[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "HS256");
+        assert_eq!(header["typ"], "JWT");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(segments[1]).unwrap()).unwrap();
+        assert_eq!(payload["sub"], "carbon_white_user");
+    }
+
+    #[test]
+    fn test_known_hs256_vector_verifies() {
+        // Signed independently of this module with HMAC-SHA256 over
+        // `{"alg":"HS256","typ":"JWT"}.{"sub":"carbon_white_user","exp":4102444800,"iat":0}`
+        // and the key `test-secret-for-unit-tests`.
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+            eyJzdWIiOiJjYXJib25fd2hpdGVfdXNlciIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjowfQ.\
+            HvQZqdIm7MkH6_n7xLfN6ywky97d8Fj6DtDjibMyftY";
+        let claims = verify_jwt_token_with_secret(b"test-secret-for-unit-tests", token).unwrap();
+        assert_eq!(claims.exp, 4_102_444_800);
+    }
+
+    #[test]
+    fn test_unsigned_and_foreign_algorithm_tokens_are_rejected() {
+        let secret = b"test-secret-for-unit-tests";
+        let valid = create_jwt_token_with_secret(secret).unwrap();
+        let payload = valid.split('.').nth(1).unwrap();
+
+        for header in [
+            r#"{"alg":"none"}"#,
+            r#"{"alg":"HS512"}"#,
+            r#"{"typ":"JWT"}"#,
+        ] {
+            let header = URL_SAFE_NO_PAD.encode(header);
+            for forged in [
+                format!("{header}.{payload}."),
+                format!("{header}.{payload}"),
+            ] {
+                assert!(
+                    verify_jwt_token_with_secret(secret, &forged).is_err(),
+                    "{forged} must be rejected"
+                );
+            }
+        }
+
+        assert!(verify_jwt_token_with_secret(secret, "").is_err());
+        assert!(verify_jwt_token_with_secret(secret, &format!("{valid}.extra")).is_err());
     }
 
     #[test]
@@ -292,6 +381,23 @@ mod test_auth {
             JWT_EXPIRATION_HOURS * 3600,
             "token should live for exactly JWT_EXPIRATION_HOURS"
         );
+    }
+
+    #[test]
+    fn test_generate_signing_key_is_random() {
+        let first = generate_signing_key();
+        let second = generate_signing_key();
+        assert_ne!(first, second);
+        assert_ne!(first, [0u8; SIGNING_KEY_LEN]);
+    }
+
+    #[test]
+    fn test_token_from_previous_key_is_rejected() {
+        // A restart draws a new key, which must invalidate earlier tokens.
+        let before_restart = generate_signing_key();
+        let after_restart = generate_signing_key();
+        let token = create_jwt_token_with_secret(&before_restart).unwrap();
+        assert!(verify_jwt_token_with_secret(&after_restart, &token).is_err());
     }
 
     #[test]
@@ -350,40 +456,12 @@ mod test_auth {
             IpAddr::from_str("192.168.1.2").unwrap(),
             &[]
         ));
-    }
 
-    #[test]
-    fn test_is_public_endpoint() {
-        // Test public endpoints
-        assert!(is_public_endpoint("/"));
-        assert!(is_public_endpoint("/login"));
-        assert!(is_public_endpoint("/api/search"));
-        assert!(is_public_endpoint("/api/auth"));
-        assert!(is_public_endpoint("/file/abc123"));
-        assert!(is_public_endpoint("/pkg/app.js"));
-        assert!(is_public_endpoint("/assets/logo.png"));
-
-        // Test protected endpoints
-        assert!(!is_public_endpoint("/submit"));
-        assert!(!is_public_endpoint("/api/submit"));
-        assert!(!is_public_endpoint("/admin"));
-    }
-
-    #[test]
-    fn test_is_public_endpoint_root_is_exact_match() {
-        // A prefix-style match on `/` would expose every route, so only the
-        // bare root may be public.
-        assert!(!is_public_endpoint("/submit"));
-        assert!(!is_public_endpoint("/anything-else"));
-    }
-
-    #[test]
-    fn test_is_public_endpoint_prefix_paths() {
-        // Prefix entries are anchored on the trailing slash, so a sibling path
-        // that merely shares the prefix must not become public.
-        assert!(is_public_endpoint("/file/deadbeef"));
-        assert!(!is_public_endpoint("/files/deadbeef"));
-        assert!(!is_public_endpoint("/pkgfiles/app.js"));
+        // A dual-stack socket reports IPv4 loopback as a mapped address.
+        assert!(is_ip_whitelisted(
+            IpAddr::from_str("::ffff:127.0.0.1").unwrap(),
+            &[]
+        ));
     }
 
     #[test]
@@ -397,21 +475,20 @@ mod test_auth {
             "authorization",
             HeaderValue::from_str("Bearer test_token").unwrap(),
         );
-        assert_eq!(
-            extract_token_from_headers(&headers),
-            Some("test_token".to_string())
-        );
+        assert_eq!(extract_token_from_headers(&headers), Some("test_token"));
 
-        // Test cookie
+        // Cookies are ignored, so a cross-site request cannot authenticate.
         headers.clear();
         headers.insert(
             "cookie",
             HeaderValue::from_str("carbon_auth_token=cookie_token; other=value").unwrap(),
         );
-        assert_eq!(
-            extract_token_from_headers(&headers),
-            Some("cookie_token".to_string())
-        );
+        assert_eq!(extract_token_from_headers(&headers), None);
+
+        // Other schemes are not bearer tokens.
+        headers.clear();
+        headers.insert("authorization", HeaderValue::from_static("Basic abc"));
+        assert_eq!(extract_token_from_headers(&headers), None);
 
         // Test no token
         headers.clear();
@@ -419,115 +496,165 @@ mod test_auth {
     }
 
     #[test]
-    fn test_get_client_ip_from_headers() {
+    fn test_is_request_authenticated() {
         use axum::http::{HeaderMap, HeaderValue};
 
-        let mut headers = HeaderMap::new();
+        let key = generate_signing_key();
+        let token = create_jwt_token_with_secret(&key).unwrap();
 
-        // Test X-Forwarded-For header
+        let mut headers = HeaderMap::new();
+        assert!(!is_request_authenticated(&headers, &key));
+
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert!(is_request_authenticated(&headers, &key));
+        assert!(!is_request_authenticated(&headers, &generate_signing_key()));
+
+        headers.clear();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("carbon_auth_token={token}")).unwrap(),
+        );
+        assert!(!is_request_authenticated(&headers, &key));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_ignores_headers_from_untrusted_peer() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        // Without a trusted proxy the headers are client controlled, so a
+        // spoofed loopback address must not be believed.
+        let peer = IpAddr::from_str("203.0.113.7").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        headers.insert("x-real-ip", HeaderValue::from_static("127.0.0.1"));
+
+        assert_eq!(resolve_client_ip(&headers, peer, &[]), Some(peer));
+
+        let unrelated_proxy = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &unrelated_proxy),
+            Some(peer)
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_uses_right_most_untrusted_hop() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let proxy = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+
+        // The client prepended a spoofed hop; the proxy appended the real one.
+        let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
-            HeaderValue::from_str("192.168.1.1, 10.0.0.1").unwrap(),
+            HeaderValue::from_static("127.0.0.1, 198.51.100.4"),
         );
         assert_eq!(
-            get_client_ip_from_headers(&headers),
-            Some(IpAddr::from_str("192.168.1.1").unwrap())
+            resolve_client_ip(&headers, proxy, &trusted),
+            Some(IpAddr::from_str("198.51.100.4").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_skips_chained_trusted_proxies() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.0/8").unwrap()];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.4, 10.0.0.2"),
+        );
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("198.51.100.4").unwrap())
         );
 
-        // Test X-Real-IP header
-        headers.clear();
-        headers.insert("x-real-ip", HeaderValue::from_str("192.168.1.2").unwrap());
+        // When every hop is trusted, the left-most one is the origin.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.3, 10.0.0.2"),
+        );
         assert_eq!(
-            get_client_ip_from_headers(&headers),
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("10.0.0.3").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_combines_repeated_headers() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.4"));
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("198.51.100.4").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_fails_closed_on_garbage() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("10.0.0.1").unwrap();
+        let trusted = vec![IPSubnet::try_from("10.0.0.1").unwrap()];
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(resolve_client_ip(&headers, peer, &trusted), None);
+
+        headers.clear();
+        headers.insert("x-real-ip", HeaderValue::from_static(""));
+        assert_eq!(resolve_client_ip(&headers, peer, &trusted), None);
+    }
+
+    #[test]
+    fn test_resolve_client_ip_from_trusted_proxy() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let peer = IpAddr::from_str("::1").unwrap();
+        let trusted = vec![IPSubnet::try_from("::1").unwrap()];
+        let mut headers = HeaderMap::new();
+
+        // No forwarding headers: the proxy itself is the client.
+        assert_eq!(resolve_client_ip(&headers, peer, &trusted), Some(peer));
+
+        headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.2"));
+        assert_eq!(
+            resolve_client_ip(&headers, peer, &trusted),
             Some(IpAddr::from_str("192.168.1.2").unwrap())
         );
 
-        // Test no IP headers
+        // Port suffixes are tolerated.
         headers.clear();
-        assert_eq!(get_client_ip_from_headers(&headers), None);
-    }
-
-    #[test]
-    fn test_get_client_ip_with_headers() {
-        use axum::http::{HeaderMap, HeaderValue};
-
-        let mut headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
-
-        // Test X-Forwarded-For header takes precedence
         headers.insert(
             "x-forwarded-for",
-            HeaderValue::from_str("192.168.1.1").unwrap(),
+            HeaderValue::from_static("192.168.1.3:5000, [2001:db8::1]:443"),
         );
         assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("192.168.1.1").unwrap())
-        );
-
-        // Test X-Real-IP header takes precedence
-        headers.clear();
-        headers.insert("x-real-ip", HeaderValue::from_str("10.0.0.1").unwrap());
-        assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("10.0.0.1").unwrap())
+            resolve_client_ip(&headers, peer, &trusted),
+            Some(IpAddr::from_str("2001:db8::1").unwrap())
         );
     }
 
     #[test]
-    fn test_get_client_ip_fallback_to_connection() {
-        use axum::http::HeaderMap;
-
+    fn test_resolve_client_ip_canonicalises_mapped_peer() {
         let headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([192, 168, 1, 100], 54321)));
-
-        // Test fallback to connection info when no headers
+        let mapped = IpAddr::from_str("::ffff:192.168.1.5").unwrap();
         assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("192.168.1.100").unwrap())
-        );
-
-        // Test IPv6 connection
-        let ipv6_connect_info = Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080)));
-        assert_eq!(
-            get_client_ip(&headers, ipv6_connect_info),
-            Some(IpAddr::from_str("::1").unwrap())
-        );
-    }
-
-    #[test]
-    fn test_get_client_ip_no_source() {
-        use axum::http::HeaderMap;
-
-        let headers = HeaderMap::new();
-        let connect_info = None;
-
-        // Test no IP source available
-        assert_eq!(get_client_ip(&headers, connect_info), None);
-    }
-
-    #[test]
-    fn test_get_client_ip_invalid_header_fallback() {
-        use axum::http::{HeaderMap, HeaderValue};
-
-        let mut headers = HeaderMap::new();
-        let connect_info = Some(SocketAddr::from(([10, 0, 0, 1], 9000)));
-
-        // Test invalid IP in header falls back to connection
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_str("invalid-ip").unwrap(),
-        );
-        assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("10.0.0.1").unwrap())
-        );
-
-        // Test empty header value falls back to connection
-        headers.clear();
-        headers.insert("x-real-ip", HeaderValue::from_str("").unwrap());
-        assert_eq!(
-            get_client_ip(&headers, connect_info),
-            Some(IpAddr::from_str("10.0.0.1").unwrap())
+            resolve_client_ip(&headers, mapped, &[]),
+            Some(IpAddr::from_str("192.168.1.5").unwrap())
         );
     }
 }

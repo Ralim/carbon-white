@@ -23,7 +23,7 @@ pub struct Document {
     pub storage_date: String,
     pub original_file_name: String,
     pub file_sha256: String,
-    pub file_path: String,
+    pub file_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

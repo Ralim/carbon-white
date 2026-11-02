@@ -21,16 +21,27 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // Load environment variables
-    let carbon_data_dir =
-        env::var("CARBON_DATA_DIR").unwrap_or_else(|_| "/tmp/carbon/".to_string());
+    let carbon_data_dir = env::var("CARBON_DATA_DIR").unwrap_or_else(|_| {
+        warn!(
+            "CARBON_DATA_DIR not set, storing data in /tmp/carbon/, which may be cleared on reboot"
+        );
+        "/tmp/carbon/".to_string()
+    });
     let carbon_auth_key = env::var("CARBON_AUTH_KEY").expect("CARBON_AUTH_KEY must be set");
     let carbon_whitelist_ips = env::var("CARBON_WHITELIST_IPS").unwrap_or_else(|_| {
         warn!("CARBON_WHITELIST_IPS not set, you only get localhost");
         "127.0.0.1,::1".to_string()
     });
+    // Forwarding headers are only believed from these peers.
+    let carbon_trusted_proxies = env::var("CARBON_TRUSTED_PROXIES").unwrap_or_default();
 
     info!("Carbon data directory: `{}`", carbon_data_dir);
     info!("IP whitelist: `{}`", carbon_whitelist_ips);
+    if carbon_trusted_proxies.trim().is_empty() {
+        info!("No trusted proxies: forwarding headers are ignored");
+    } else {
+        info!("Trusted proxies: `{}`", carbon_trusted_proxies);
+    }
 
     // Create data directories
     std::fs::create_dir_all(&carbon_data_dir).expect("Failed to create data directory");
@@ -46,12 +57,13 @@ async fn main() {
         .expect("Failed to initialize database");
 
     // Create app state
-    let app_state = AppState {
-        database,
-        data_dir: carbon_data_dir,
-        auth_key: carbon_auth_key,
-        whitelist_ips: parse_ip_whitelist(&carbon_whitelist_ips),
-    };
+    let whitelist = parse_subnet_list(&carbon_whitelist_ips);
+    if whitelist.is_empty() {
+        warn!("CARBON_WHITELIST_IPS has no valid entries, so only loopback clients may log in");
+    }
+    let app_state = AppState::new(database, carbon_data_dir, carbon_auth_key)
+        .with_whitelist(whitelist)
+        .with_trusted_proxies(parse_subnet_list(&carbon_trusted_proxies));
 
     // Setting get_configuration(None) means we'll be using cargo-leptos's env values
     let conf = get_configuration(None).unwrap();
@@ -73,21 +85,22 @@ async fn main() {
         .with_state(app_state);
 
     // Create static routes (must come before leptos routes to avoid fallback catching them)
+    let favicon = {
+        let site_root = leptos_options.site_root.clone();
+        axum::routing::get(move |request: axum::extract::Request| {
+            let site_root = site_root.clone();
+            async move { serve_favicon_at(request, &site_root).await }
+        })
+    };
     let static_routes = Router::new()
         .nest_service("/pkg", pkg_service)
-        .route("/favicon.ico", axum::routing::get(serve_favicon))
-        .route("/favicon-16x16.png", axum::routing::get(serve_favicon))
-        .route("/favicon-32x32.png", axum::routing::get(serve_favicon))
-        .route("/apple-touch-icon.png", axum::routing::get(serve_favicon))
-        .route("/site.webmanifest", axum::routing::get(serve_favicon))
-        .route(
-            "/android-chrome-192x192.png",
-            axum::routing::get(serve_favicon),
-        )
-        .route(
-            "/android-chrome-512x512.png",
-            axum::routing::get(serve_favicon),
-        );
+        .route("/favicon.ico", favicon.clone())
+        .route("/favicon-16x16.png", favicon.clone())
+        .route("/favicon-32x32.png", favicon.clone())
+        .route("/apple-touch-icon.png", favicon.clone())
+        .route("/site.webmanifest", favicon.clone())
+        .route("/android-chrome-192x192.png", favicon.clone())
+        .route("/android-chrome-512x512.png", favicon);
 
     // Create the leptos app with its own state (fallback catches everything not matched above)
     let leptos_app = Router::new()
@@ -99,7 +112,10 @@ async fn main() {
         .with_state(leptos_options);
 
     // Merge them together - order matters! Static and API routes first, then leptos fallback
-    let app = static_routes.merge(api_routes).merge(leptos_app);
+    let app = static_routes
+        .merge(api_routes)
+        .merge(leptos_app)
+        .layer(axum::middleware::map_response(security_headers::apply));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Carbon White server listening on http://{}", &addr);
@@ -107,25 +123,51 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .unwrap();
+}
+
+/// Resolves on Ctrl+C or SIGTERM.
+///
+/// In a container the server is PID 1, which the kernel shields from signals
+/// without a handler, so without this `podman stop` waits out its timeout and
+/// falls back to SIGKILL.
+#[cfg(feature = "ssr")]
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to listen for Ctrl+C: {}", e);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to listen for SIGTERM: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("Shutdown requested, finishing in-flight requests");
 }
 
 #[cfg(not(feature = "ssr"))]
 pub fn main() {
     // no client-side main function
     // see lib.rs for hydration function instead
-}
-
-#[cfg(feature = "ssr")]
-async fn serve_favicon(
-    request: axum::extract::Request,
-) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
-    use leptos::prelude::*;
-
-    // Resolve the site root from the build-time configuration and delegate.
-    let site_root = get_configuration(None).unwrap().leptos_options.site_root;
-    serve_favicon_at(request, site_root.as_ref()).await
 }
 
 /// Serves a static asset from `site_root`.
@@ -170,16 +212,22 @@ async fn serve_favicon_at(
     }
 }
 
-/// Parses a comma-separated whitelist of IPs or CIDR ranges.
+/// Parses a comma-separated list of IPs or CIDR ranges.
+///
+/// Invalid entries are skipped with a warning rather than failing startup, so
+/// a typo is visible in the log instead of silently narrowing the list.
 #[cfg(feature = "ssr")]
-fn parse_ip_whitelist(whitelist: &str) -> Vec<IPSubnet> {
-    if whitelist.is_empty() {
-        return Vec::new();
-    }
-
-    whitelist
-        .split(',')
-        .filter_map(|ip| ip.trim().try_into().ok())
+fn parse_subnet_list(list: &str) -> Vec<IPSubnet> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| match IPSubnet::try_from(entry) {
+            Ok(subnet) => Some(subnet),
+            Err(e) => {
+                tracing::warn!("Ignoring invalid address or subnet `{}`: {}", entry, e);
+                None
+            }
+        })
         .collect()
 }
 
@@ -194,21 +242,21 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_parse_ip_whitelist_empty() {
-        let result = parse_ip_whitelist("");
+    fn test_parse_subnet_list_empty() {
+        let result = parse_subnet_list("");
         assert!(result.is_empty());
     }
 
     #[test]
-    fn test_parse_ip_whitelist_single_ip() {
-        let result = parse_ip_whitelist("127.0.0.1");
+    fn test_parse_subnet_list_single_ip() {
+        let result = parse_subnet_list("127.0.0.1");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].to_string(), "127.0.0.1");
     }
 
     #[test]
-    fn test_parse_ip_whitelist_multiple_ips() {
-        let result = parse_ip_whitelist("127.0.0.1,192.168.1.1,::1");
+    fn test_parse_subnet_list_multiple_ips() {
+        let result = parse_subnet_list("127.0.0.1,192.168.1.1,::1");
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].to_string(), "127.0.0.1");
         assert_eq!(result[1].to_string(), "192.168.1.1");
@@ -216,19 +264,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ip_whitelist_with_spaces() {
-        let result = parse_ip_whitelist(" 127.0.0.1 , 192.168.1.1 ");
+    fn test_parse_subnet_list_with_spaces() {
+        let result = parse_subnet_list(" 127.0.0.1 , 192.168.1.1 ");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].to_string(), "127.0.0.1");
         assert_eq!(result[1].to_string(), "192.168.1.1");
     }
 
     #[test]
-    fn test_parse_ip_whitelist_invalid_ips() {
-        let result = parse_ip_whitelist("127.0.0.1,invalid,192.168.1.1");
+    fn test_parse_subnet_list_invalid_ips() {
+        let result = parse_subnet_list("127.0.0.1,invalid,192.168.1.1");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].to_string(), "127.0.0.1");
         assert_eq!(result[1].to_string(), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_parse_subnet_list_skips_blank_entries_and_bad_prefixes() {
+        let result = parse_subnet_list("10.0.0.0/8, ,192.168.0.0/33,");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "10.0.0.0/8");
+
+        assert!(parse_subnet_list(" , ").is_empty());
     }
 
     #[tokio::test]
@@ -243,16 +300,13 @@ mod tests {
             .await
             .expect("Failed to initialize test database");
 
-        let app_state = AppState {
-            database,
-            data_dir: temp_path.clone(),
-            auth_key: "test_auth_key".to_string(),
-            whitelist_ips: parse_ip_whitelist("127.0.0.1"),
-        };
+        let app_state = AppState::new(database, temp_path.clone(), "test_auth_key")
+            .with_whitelist(parse_subnet_list("127.0.0.1"));
 
         assert_eq!(app_state.data_dir, temp_path);
         assert_eq!(app_state.auth_key, "test_auth_key");
         assert_eq!(app_state.whitelist_ips.len(), 1);
+        assert!(app_state.trusted_proxies.is_empty());
     }
 
     #[tokio::test]
@@ -277,12 +331,8 @@ mod tests {
             .await
             .expect("Failed to initialize test database");
 
-        let app_state = AppState {
-            database,
-            data_dir: temp_path,
-            auth_key: "test_auth_key".to_string(),
-            whitelist_ips: parse_ip_whitelist("127.0.0.1"),
-        };
+        let app_state = AppState::new(database, temp_path, "test_auth_key")
+            .with_whitelist(parse_subnet_list("127.0.0.1"));
 
         // Test that we can create API routes
         let _api_routes = api::create_api_routes();
@@ -338,12 +388,8 @@ mod tests {
             .await
             .expect("Failed to initialize test database");
 
-        let app_state = AppState {
-            database,
-            data_dir: temp_path,
-            auth_key: "test_auth_key_123".to_string(),
-            whitelist_ips: vec![], // Empty whitelist allows loopback only
-        };
+        // Empty whitelist allows loopback only
+        let app_state = AppState::new(database, temp_path, "test_auth_key_123");
 
         // Create API router
         let api_router = api::create_api_routes().with_state(app_state);
@@ -456,14 +502,13 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let temp_path = temp_dir.path().to_string_lossy().to_string();
 
-        let app_state = AppState {
-            database: database::init_db(&temp_path)
+        let app_state = AppState::new(
+            database::init_db(&temp_path)
                 .await
                 .expect("Failed to initialize test database"),
-            data_dir: temp_path,
-            auth_key: "test_auth_key_123".to_string(),
-            whitelist_ips: vec![],
-        };
+            temp_path,
+            "test_auth_key_123",
+        );
 
         let api_router = api::create_api_routes().with_state(app_state);
 
@@ -491,6 +536,198 @@ mod tests {
 
         assert_eq!(result["success"], false);
         assert!(result["token"].is_null());
+    }
+
+    /// Sends a login request from `peer` with an optional `X-Forwarded-For`.
+    async fn login_from(
+        router: axum::Router,
+        peer: SocketAddr,
+        forwarded_for: Option<&str>,
+        key: &str,
+    ) -> serde_json::Value {
+        login_with_status(router, peer, forwarded_for, key).await.1
+    }
+
+    async fn login_with_status(
+        router: axum::Router,
+        peer: SocketAddr,
+        forwarded_for: Option<&str>,
+        key: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/auth")
+            .header("content-type", "application/json");
+        if let Some(forwarded_for) = forwarded_for {
+            builder = builder.header("x-forwarded-for", forwarded_for);
+        }
+        let mut request = builder
+            .body(Body::from(
+                serde_json::json!({ "auth_key": key }).to_string(),
+            ))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_auth_bans_after_repeated_failures() {
+        use axum::http::StatusCode;
+        use carbon_white::rate_limit::MAX_FAILED_ATTEMPTS;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let state = AppState::new(
+            database::init_db(&temp_path).await.unwrap(),
+            temp_path,
+            "test_auth_key_123",
+        )
+        .with_whitelist(parse_subnet_list("192.168.0.0/24"));
+        let router = api::create_api_routes().with_state(state);
+        let attacker = SocketAddr::from(([192, 168, 0, 66], 40000));
+
+        for _ in 1..MAX_FAILED_ATTEMPTS {
+            let (status, body) = login_with_status(router.clone(), attacker, None, "wrong").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["success"], false);
+        }
+        let (status, _) = login_with_status(router.clone(), attacker, None, "wrong").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // Once banned, even the correct key is refused.
+        let (status, body) =
+            login_with_status(router.clone(), attacker, None, "test_auth_key_123").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["success"], false);
+        assert!(body["token"].is_null());
+
+        // Other clients are unaffected.
+        let other = SocketAddr::from(([192, 168, 0, 67], 40000));
+        let (status, body) = login_with_status(router, other, None, "test_auth_key_123").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], true);
+    }
+
+    #[tokio::test]
+    async fn test_auth_ignores_spoofed_forwarded_for_without_trusted_proxy() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let state = AppState::new(
+            database::init_db(&temp_path).await.unwrap(),
+            temp_path,
+            "test_auth_key_123",
+        );
+        let router = api::create_api_routes().with_state(state);
+
+        // Claiming to be loopback must not get a remote client past the whitelist.
+        let result = login_from(
+            router,
+            SocketAddr::from(([203, 0, 113, 7], 40000)),
+            Some("127.0.0.1"),
+            "test_auth_key_123",
+        )
+        .await;
+        assert_eq!(result["success"], false);
+        assert!(result["token"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_auth_believes_forwarded_for_from_trusted_proxy() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let state = AppState::new(
+            database::init_db(&temp_path).await.unwrap(),
+            temp_path,
+            "test_auth_key_123",
+        )
+        .with_whitelist(parse_subnet_list("192.168.0.0/24"))
+        .with_trusted_proxies(parse_subnet_list("10.0.0.1"));
+        let router = api::create_api_routes().with_state(state);
+        let proxy = SocketAddr::from(([10, 0, 0, 1], 40000));
+
+        let allowed = login_from(
+            router.clone(),
+            proxy,
+            Some("192.168.0.20"),
+            "test_auth_key_123",
+        )
+        .await;
+        assert_eq!(allowed["success"], true);
+
+        // The proxy appends the real address, so a spoofed left-most hop loses.
+        let refused = login_from(
+            router,
+            proxy,
+            Some("192.168.0.20, 203.0.113.7"),
+            "test_auth_key_123",
+        )
+        .await;
+        assert_eq!(refused["success"], false);
+    }
+
+    #[tokio::test]
+    async fn test_tokens_are_signed_with_per_start_key() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let pool = database::init_db(&temp_path).await.unwrap();
+        let auth_key = "test_auth_key_123";
+
+        async fn is_authenticated(router: axum::Router, token: &str) -> bool {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/auth/status")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["authenticated"] == true
+        }
+
+        let first_start = api::create_api_routes().with_state(AppState::new(
+            pool.clone(),
+            temp_path.clone(),
+            auth_key,
+        ));
+        let token = login_from(
+            first_start.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 40000)),
+            None,
+            auth_key,
+        )
+        .await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(is_authenticated(first_start.clone(), &token).await);
+
+        // The login key must not be usable as a signing key.
+        let forged = create_jwt_token_with_secret(auth_key.as_bytes()).unwrap();
+        assert!(!is_authenticated(first_start, &forged).await);
+
+        // A restart with the same login key draws a new signing key.
+        let second_start =
+            api::create_api_routes().with_state(AppState::new(pool, temp_path, auth_key));
+        assert!(!is_authenticated(second_start, &token).await);
     }
 
     /// Builds a router over a temp database seeded with `count` documents.
@@ -527,14 +764,329 @@ mod tests {
             .expect("document should be inserted");
         }
 
-        let state = AppState {
-            database: pool,
-            data_dir: db_dir,
-            auth_key: "test_auth_key".to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(pool, db_dir, "test_auth_key");
 
         (api::create_api_routes().with_state(state), temp_dir)
+    }
+
+    const BOUNDARY: &str = "----cwtestboundary";
+
+    /// Builds a multipart/form-data body with a title and a single file part.
+    fn multipart_body(title: &str, filename: &str, content: &[u8]) -> Vec<u8> {
+        multipart_with_fields(&[("title", title)], filename, content)
+    }
+
+    /// Builds a multipart/form-data body with text fields and a single file part.
+    fn multipart_with_fields(fields: &[(&str, &str)], filename: &str, content: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    /// Posts a raw multipart body to `/submit` with a valid session token.
+    async fn post_submit(
+        router: axum::Router,
+        state: &AppState,
+        body: Vec<u8>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let token = create_jwt_token_with_secret(&state.signing_key).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/submit")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    /// A router and state over a fresh data directory.
+    async fn upload_router() -> (axum::Router, AppState, TempDir) {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        let data_dir = temp_dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(format!("{data_dir}/files")).unwrap();
+        let pool = database::init_db(&data_dir)
+            .await
+            .expect("Failed to init db");
+        let state = AppState::new(pool, data_dir, "upload_test_key");
+        let router = api::create_api_routes().with_state(state.clone());
+        (router, state, temp_dir)
+    }
+
+    fn staged_uploads(data_dir: &str) -> Vec<String> {
+        match std::fs::read_dir(format!("{data_dir}/files/.incoming")) {
+            Ok(entries) => entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_losing_duplicate_upload_keeps_stored_file() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"race contents";
+        let hash = hex::encode(Sha256::digest(content));
+
+        // Simulates the winner of a concurrent upload: its row and file are in
+        // place under the same sanitized name the loser will compute.
+        let stored = std::path::Path::new(&state.data_dir)
+            .join("files")
+            .join(&hash)
+            .join("same.pdf");
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, content).unwrap();
+        database::insert_document_if_absent(
+            &state.database,
+            database::NewDocument {
+                title: "Winner".to_string(),
+                part_number: None,
+                manufacturer: None,
+                document_id: None,
+                document_version: None,
+                package_marking: None,
+                device_address: None,
+                notes: None,
+                storage_date: "2024-01-01".to_string(),
+                original_file_name: "same.pdf".to_string(),
+                file_sha256: hash.clone(),
+                file_path: stored.to_string_lossy().to_string(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let response =
+            post_submit(router, &state, multipart_body("Loser", "same.pdf", content)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+
+        assert_eq!(std::fs::read(&stored).unwrap(), content);
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failed_move_rolls_back_database_row() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"cannot be stored";
+        let hash = hex::encode(Sha256::digest(content));
+
+        // A regular file where the hash directory belongs makes the move fail.
+        std::fs::write(
+            std::path::Path::new(&state.data_dir)
+                .join("files")
+                .join(&hash),
+            b"",
+        )
+        .unwrap();
+
+        let response =
+            post_submit(router, &state, multipart_body("Title", "doc.pdf", content)).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let row = database::get_document_by_sha256(&state.database, &hash)
+            .await
+            .unwrap();
+        assert!(row.is_none(), "a row without its file must not remain");
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_stores_blank_fields_as_null() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"normalised";
+
+        // The submit page always sends every field, blank or not.
+        let body = multipart_with_fields(
+            &[
+                ("title", "  Spaced Title  "),
+                ("part_number", ""),
+                ("manufacturer", "   "),
+                ("notes", " kept "),
+            ],
+            "n.pdf",
+            content,
+        );
+        let response = post_submit(router, &state, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = database::get_document_by_sha256(
+            &state.database,
+            &hex::encode(Sha256::digest(content)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.title, "Spaced Title");
+        assert_eq!(stored.part_number, None);
+        assert_eq!(stored.manufacturer, None);
+        assert_eq!(stored.notes.as_deref(), Some("kept"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_ignores_cookie_token() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use tower::ServiceExt;
+
+        let (router, state, _temp) = upload_router().await;
+        let token = create_jwt_token_with_secret(&state.signing_key).unwrap();
+
+        // A cross-site form post would carry cookies but cannot set headers.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/submit")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .header("cookie", format!("carbon_auth_token={token}"))
+            .body(Body::from(multipart_body("Forged", "f.pdf", b"forged")))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["message"], "Authentication required");
+        assert!(staged_uploads(&state.data_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_document_returns_file_name_not_path() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use carbon_white::auth::create_jwt_token_with_secret;
+        use sha2::{Digest, Sha256};
+        use tower::ServiceExt;
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"path privacy";
+        let response = post_submit(
+            router.clone(),
+            &state,
+            multipart_body("Private", "../secret name.pdf", content),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hash = hex::encode(Sha256::digest(content));
+        let token = create_jwt_token_with_secret(&state.signing_key).unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/document/{hash}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["file_name"], "secret name.pdf");
+        assert!(json.get("file_path").is_none());
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&state.data_dir),
+            "the data directory must not leak: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_stores_path_relative_to_data_dir() {
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let (router, state, _temp) = upload_router().await;
+        let content = b"relative";
+        let response = post_submit(router, &state, multipart_body("Rel", "r.pdf", content)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hash = hex::encode(Sha256::digest(content));
+        let stored = database::get_document_by_sha256(&state.database, &hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.file_path, format!("files/{hash}/r.pdf"));
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&state.data_dir).join(&stored.file_path)).unwrap(),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malformed_upload_leaves_no_staged_file() {
+        use axum::http::StatusCode;
+
+        let (router, state, _temp) = upload_router().await;
+
+        // A complete file part followed by a field that never terminates.
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"a.pdf\"\r\n\r\n",
+        );
+        body.extend_from_slice(b"staged bytes");
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"notes\"\r\n\r\ncut off");
+
+        let response = post_submit(router, &state, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            staged_uploads(&state.data_dir).is_empty(),
+            "found: {:?}",
+            staged_uploads(&state.data_dir)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_without_title_leaves_no_staged_file() {
+        use axum::http::StatusCode;
+
+        let (router, state, _temp) = upload_router().await;
+        let response = post_submit(router, &state, multipart_body("", "a.pdf", b"bytes")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(staged_uploads(&state.data_dir).is_empty());
     }
 
     #[tokio::test]
@@ -550,15 +1102,11 @@ mod tests {
         std::fs::create_dir_all(format!("{}/files", db_dir)).unwrap();
 
         let pool = database::init_db(&db_dir).await.expect("Failed to init db");
-        let state = AppState {
-            database: pool,
-            data_dir: db_dir.clone(),
-            auth_key: auth_key.to_string(),
-            whitelist_ips: vec![],
-        };
+        let state = AppState::new(pool, db_dir.clone(), auth_key);
+        let signing_key = state.signing_key.clone();
         let router = api::create_api_routes().with_state(state);
 
-        let token = create_jwt_token_with_secret(auth_key.as_bytes()).unwrap();
+        let token = create_jwt_token_with_secret(&signing_key).unwrap();
         let boundary = "----cwtestboundary";
         let content = b"identical file contents";
 
@@ -943,7 +1491,6 @@ mod tests {
         ];
 
         // This test verifies that the routes we expect are handled
-        // In a real server setup, these would all map to the serve_favicon function
         for route in favicon_routes {
             assert!(route.starts_with('/'));
             assert!(!route.is_empty());

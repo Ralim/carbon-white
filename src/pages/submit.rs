@@ -413,7 +413,10 @@ pub fn SubmitPage() -> impl IntoView {
 
                         <div class="submit-info">
                             <p class="info-text">
-                                "* Required fields. Files up to 100MB are supported."
+                                {format!(
+                                    "* Required fields. Files up to {} MiB are supported.",
+                                    crate::MAX_UPLOAD_SIZE / (1024 * 1024)
+                                )}
                             </p>
                         </div>
                     </div>

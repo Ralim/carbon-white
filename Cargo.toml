@@ -1,6 +1,6 @@
 [package]
 name = "carbon-white"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 
 [lib]
@@ -17,17 +17,37 @@ wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 console_log = "1"
 log = "0.4"
-web-sys = { version = "0.3", features = ["HtmlInputElement", "FileList", "File", "Blob", "Window", "Storage", "Request", "RequestInit", "Response", "Headers", "XmlHttpRequest", "FormData"] }
+web-sys = { version = "0.3", features = [
+  "HtmlInputElement",
+  "FileList",
+  "File",
+  "Blob",
+  "Window",
+  "Storage",
+  "Request",
+  "RequestInit",
+  "Response",
+  "Headers",
+  "XmlHttpRequest",
+  "FormData",
+] }
 wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 
 # Server dependencies
 axum = { version = "0.8", optional = true, features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tower-http = { version = "0.7", features = ["fs"], optional = true }
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"], optional = true }
+sqlx = { version = "0.9", features = [
+  "runtime-tokio",
+  "sqlite",
+], optional = true }
 # Search uses SQLite's FTS5 module. sqlx links against the system SQLite by
 # default, and FTS5 is a compile-time option that some distributions build
 # without -- notably the `debian:trixie-slim` runtime image, which is not even
@@ -38,9 +58,13 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"], optional = tru
 libsqlite3-sys = { version = "0.37", optional = true, features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
+uuid = { version = "1.29", features = ["v4", "serde"], optional = true }
+getrandom = { version = "0.4", optional = true }
 sha2 = { version = "0.11", optional = true }
-jsonwebtoken = { version = "11", features = ["rust_crypto"], optional = true }
+# Session tokens are HS256 JWTs built on these directly; a JWT library would
+# also pull in RSA and ECDSA code that is never used.
+hmac = { version = "0.13", optional = true }
+base64 = { version = "0.23", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
@@ -50,34 +74,36 @@ urlencoding = "2.1"
 
 # Client-side HTTP requests
 gloo-net = { version = "0.7", features = ["http"], optional = true }
-gloo-timers = "0.4"
+gloo-timers = { version = "0.4", features = ["futures"] }
 thiserror = "2.0"
 hex = "0.4"
 
 [dev-dependencies]
-tempfile = "3.0"
+tempfile = "3.27"
 
 [features]
-hydrate = ["leptos/hydrate",  "dep:gloo-net"]
+hydrate = ["leptos/hydrate", "dep:gloo-net"]
 ssr = [
-    "dep:axum",
-    "dep:tokio",
-    "dep:tower",
-    "dep:tower-http",
-    "dep:leptos_axum",
-    "dep:sqlx",
-    "dep:libsqlite3-sys",
-    "dep:uuid",
-    "dep:sha2",
-    "dep:jsonwebtoken",
-    "dep:chrono",
-    "dep:tracing",
-    "dep:tracing-subscriber",
-    "dep:mime_guess",
-    "dep:futures-util",
-    "leptos/ssr",
-    "leptos_meta/ssr",
-    "leptos_router/ssr"
+  "dep:axum",
+  "dep:tokio",
+  "dep:tower",
+  "dep:tower-http",
+  "dep:leptos_axum",
+  "dep:sqlx",
+  "dep:libsqlite3-sys",
+  "dep:uuid",
+  "dep:getrandom",
+  "dep:sha2",
+  "dep:hmac",
+  "dep:base64",
+  "dep:chrono",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+  "dep:mime_guess",
+  "dep:futures-util",
+  "leptos/ssr",
+  "leptos_meta/ssr",
+  "leptos_router/ssr",
 ]
 
 # Defines a size-optimized profile for the WASM bundle in release mode

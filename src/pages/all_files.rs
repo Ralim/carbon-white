@@ -45,48 +45,61 @@ pub fn AllFilesPage() -> impl IntoView {
     let (error_message, set_error_message) = signal(Option::<String>::None);
     let (is_authenticated, _set_is_authenticated) = signal(false);
 
-    // Reload the listing whenever the requested page changes.
+    // Reload the listing whenever the requested page changes. Only the newest
+    // request may apply its result, so quick pagination clicks cannot leave an
+    // older page on screen.
     #[cfg(feature = "hydrate")]
-    Effect::new(move |_| {
-        use leptos::task::spawn_local;
+    {
+        let latest = crate::shared::LatestRequest::default();
+        Effect::new(move |_| {
+            use leptos::task::spawn_local;
 
-        let requested_page = page.get();
-        set_is_loading.set(true);
-        set_error_message.set(None);
+            let requested_page = page.get();
+            let id = latest.begin();
+            let latest = latest.clone();
+            set_is_loading.set(true);
+            set_error_message.set(None);
 
-        spawn_local(async move {
-            let token = stored_auth_token();
+            spawn_local(async move {
+                let token = stored_auth_token();
 
-            let mut auth_request = gloo_net::http::Request::get("/api/auth/status");
-            if let Some(token) = token.as_ref() {
-                auth_request = auth_request.header("Authorization", &format!("Bearer {}", token));
-            }
+                let mut auth_request = gloo_net::http::Request::get("/api/auth/status");
+                if let Some(token) = token.as_ref() {
+                    auth_request =
+                        auth_request.header("Authorization", &format!("Bearer {}", token));
+                }
 
-            // A failure here only hides the "Edit" actions; the listing itself
-            // is public, so do not surface it as a page-level error.
-            if let Some(authenticated) = fetch_auth_status(auth_request).await {
-                _set_is_authenticated.set(authenticated);
-            }
+                // A failure here only hides the "Edit" actions; the listing itself
+                // is public, so do not surface it as a page-level error.
+                if let Some(authenticated) = fetch_auth_status(auth_request).await {
+                    _set_is_authenticated.set(authenticated);
+                }
 
-            match fetch_page(requested_page).await {
-                Ok(response) => {
-                    set_documents.set(response.results);
-                    set_total_pages.set(response.total_pages);
-                    // The server clamps out-of-range pages, so follow it.
-                    if response.page != requested_page {
-                        set_page.set(response.page);
+                let result = fetch_page(requested_page).await;
+                if !latest.is_current(id) {
+                    return;
+                }
+
+                match result {
+                    Ok(response) => {
+                        set_documents.set(response.results);
+                        set_total_pages.set(response.total_pages);
+                        // The server clamps out-of-range pages, so follow it.
+                        if response.page != requested_page {
+                            set_page.set(response.page);
+                        }
+                    }
+                    Err(e) => {
+                        set_error_message.set(Some(e));
+                        set_documents.set(Vec::new());
+                        set_total_pages.set(1);
                     }
                 }
-                Err(e) => {
-                    set_error_message.set(Some(e));
-                    set_documents.set(Vec::new());
-                    set_total_pages.set(1);
-                }
-            }
 
-            set_is_loading.set(false);
+                set_is_loading.set(false);
+            });
         });
-    });
+    }
 
     view! {
         <div class="app-container">
